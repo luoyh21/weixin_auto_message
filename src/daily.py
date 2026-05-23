@@ -39,6 +39,42 @@ def _wrap_header(body: str, date_str: str, session_label: str = "每日") -> str
     return f"【🚀 航天{session_label}速递 {date_str}】\n{body.strip()}"
 
 
+_WP_THUMB_RE = re.compile(r"-(\d{2,4})x(\d{2,4})(?=\.[a-zA-Z]{2,4}(?:\?|$))")
+
+
+def _upgrade_image_to_full(url: str) -> str:
+    """把 WordPress 风格的缩略图 URL 升级为原图。
+
+    例如：
+        foo-300x169.png            -> foo.png
+        foo-1024x576.jpg?ssl=1     -> foo.jpg?ssl=1
+    其它形态原样返回。
+    """
+    if not url:
+        return url
+    return _WP_THUMB_RE.sub("", url)
+
+
+def _is_spacenews_source(article: dict) -> bool:
+    src = (article.get("source") or "").lower()
+    img = (article.get("image_url") or "").lower()
+    link = (article.get("link") or article.get("original_link") or "").lower()
+    return ("spacenews" in src) or ("spacenews.com" in img) or ("spacenews.com" in link)
+
+
+def _pick_hero_image(articles: list[dict]) -> str:
+    """挑选封面图：优先 SpaceNews 文章的图，且把 WordPress 缩略图升级为原图。"""
+    # 1) 优先 SpaceNews 来源
+    for a in articles:
+        if _is_spacenews_source(a) and a.get("image_url"):
+            return _upgrade_image_to_full(a["image_url"])
+    # 2) 退化到第一张有图的
+    for a in articles:
+        if a.get("image_url"):
+            return _upgrade_image_to_full(a["image_url"])
+    return ""
+
+
 def _split_overview_and_list(summary: str) -> tuple[str, str]:
     """把整段 summary 切成『头部(标题+总览)』+『新闻列表』两块。
 
@@ -96,7 +132,6 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
 
     # ----- 为国际新闻生成中文翻译页，并把链接重写到 /news/... -----
     batch_id = f"{session_key}_{datetime.now().strftime('%Y-%m-%d')}"
-    hero_image_url: str = ""
     if sn:
         try:
             page_map = prepare_news_pages(sn, batch_id=batch_id)
@@ -109,14 +144,10 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
             if pr:
                 a["original_link"] = a["link"]
                 a["link"] = f"{public_base}/news/{pr.page_path}"
-                if not hero_image_url and pr.image_url:
-                    hero_image_url = pr.image_url
-        # 若主图仍空，从原始 image_url 中找一张
-        if not hero_image_url:
-            for a in sn:
-                if a.get("image_url"):
-                    hero_image_url = a["image_url"]
-                    break
+                # 把翻译页里选定的「主图」回填到文章上，方便后面挑封面
+                if pr.image_url and not a.get("image_url"):
+                    a["image_url"] = pr.image_url
+    hero_image_url = _pick_hero_image(sn)
 
     date_str = _today_str()
     if not sn and not opml:

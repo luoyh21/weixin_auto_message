@@ -8,7 +8,12 @@ name: scrape-spacenews
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    # 服务端 08:00 / 16:00 Beijing (00:00 / 08:00 UTC) 推送
+    # 仅在发送前 30 分钟和 5 分钟各抓一次（一天 4 次），避免 429
+    - cron: "30 23 * * *"   # 07:30 Beijing — 早班送前
+    - cron: "55 23 * * *"   # 07:55 Beijing — 早班送前
+    - cron: "30 7 * * *"    # 15:30 Beijing — 晚班送前
+    - cron: "55 7 * * *"    # 15:55 Beijing — 晚班送前
   workflow_dispatch:
 
 jobs:

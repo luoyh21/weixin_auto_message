@@ -8,3 +8,5 @@ data/cache/
 .DS_Store
 .idea/
 .vscode/
+*.html
+data/news_pages/manifest.json

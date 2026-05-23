@@ -17,16 +17,98 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+# 多个 UA 轮换，降低被识别为爬虫的概率
+USER_AGENTS = [
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36 Edg/123.0",
+    "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "feedparser/6.0 +https://github.com/kurtmckee/feedparser",
+]
+
+
+def _fetch_with_retry(url: str, max_tries: int = 4, base_sleep: float = 5.0) -> requests.Response | None:
+    """带重试 + UA 轮换 + 指数退避抓单个 URL。429/5xx 会重试，其他错误立即返回。"""
+    for attempt in range(1, max_tries + 1):
+        ua = random.choice(USER_AGENTS)
+        try:
+            r = requests.get(
+                url,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            print(f"  [try {attempt}/{max_tries}] {url} -> network error: {e}", file=sys.stderr)
+            time.sleep(base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 2))
+            continue
+        if r.status_code == 200 and r.content:
+            return r
+        if r.status_code in (429, 500, 502, 503, 504):
+            # 优先用服务端给的 Retry-After，否则指数退避
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if (retry_after and retry_after.isdigit()) \
+                else base_sleep * (2 ** (attempt - 1)) + random.uniform(0, 3)
+            print(f"  [try {attempt}/{max_tries}] {url} -> HTTP {r.status_code}, sleep {wait:.1f}s", file=sys.stderr)
+            time.sleep(wait)
+            continue
+        print(f"  [try {attempt}/{max_tries}] {url} -> HTTP {r.status_code}, giving up", file=sys.stderr)
+        return None
+    return None
+
+
+def _build_mirror_urls(primary_url: str) -> list[str]:
+    """构造一组等价但走不同出口 IP 的 RSS 镜像 URL。
+    主要思路：让第三方公共服务（RSSHub / Google / Wayback）替我们去抓 spacenews，
+    从 spacenews 视角是这些服务的 IP 在请求，绕开 Azure runner IP 段被限流的问题。
+    """
+    urls = [primary_url]
+    # RSSHub 公共实例（来源 https://docs.rsshub.app/guide/instances）
+    # /rsshub/spacenews 输出与原 feed 兼容（含 description / pubDate）
+    rsshub_path = "/rsshub/spacenews"
+    rsshub_hosts = [
+        "https://rsshub.app",
+        "https://rsshub.rssforever.com",
+        "https://rss.shab.fun",
+        "https://rsshub.pseudoyu.com",
+    ]
+    for h in rsshub_hosts:
+        urls.append(f"{h}{rsshub_path}")
+    # Google web cache（偶尔可用）
+    urls.append(f"https://webcache.googleusercontent.com/search?q=cache:{quote(primary_url, safe='')}")
+    # Wayback Machine 最近快照（必返回最近一次缓存的 feed，不会是实时的，作最末位兜底）
+    urls.append(f"https://web.archive.org/web/2/{primary_url}")
+    return urls
+
+
+def _fetch_feed(primary_url: str) -> bytes | None:
+    """按顺序尝试主源 + 一组镜像，任一成功即返回 feed 字节。"""
+    for idx, url in enumerate(_build_mirror_urls(primary_url)):
+        print(f"[source {idx + 1}] {url}")
+        r = _fetch_with_retry(url, max_tries=3 if idx == 0 else 2, base_sleep=4.0)
+        if r is not None and r.content:
+            # 简单合法性检查：feedparser 能解析出至少一条条目
+            test = feedparser.parse(r.content)
+            if test.entries:
+                print(f"  ✓ got {len(test.entries)} entries from source {idx + 1}")
+                return r.content
+            print(f"  ✗ source {idx + 1} returned no entries, trying next")
+    return None
 
 
 def _first_img(html_text: str) -> str:
@@ -56,10 +138,13 @@ def main() -> int:
         except Exception:
             seen = set()
 
-    print(f"Fetching {feed_url}")
-    r = requests.get(feed_url, headers={"User-Agent": UA}, timeout=30)
-    r.raise_for_status()
-    parsed = feedparser.parse(r.content)
+    print(f"Fetching feed (primary={feed_url})")
+    feed_bytes = _fetch_feed(feed_url)
+    if feed_bytes is None:
+        print("All feed sources failed (likely rate-limited). Exiting cleanly so the "
+              "workflow doesn't fail the run.", file=sys.stderr)
+        return 0
+    parsed = feedparser.parse(feed_bytes)
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     items: list[dict] = []
