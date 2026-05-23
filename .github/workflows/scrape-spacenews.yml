@@ -1,0 +1,37 @@
+name: scrape-spacenews
+
+# 每 30 分钟在 GitHub 海外 runner 上抓取 SpaceNews RSS（含 content:encoded 全文）
+# 解析后 POST 到国内服务器的 /ingest/spacenews。
+# 配置：在仓库 Settings → Secrets 中添加
+#   INGEST_URL     例 http://your.server.cn:8503/ingest/spacenews
+#   INGEST_TOKEN   与服务器 .env 的 SPACENEWS_INGEST_TOKEN 一致
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests feedparser beautifulsoup4 lxml
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: scripts/scrape_spacenews_remote.state.json
+          key: spacenews-scrape-state-${{ github.run_id }}
+          restore-keys: |
+            spacenews-scrape-state-
+      - name: Scrape & push
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          FEED_URL: ${{ vars.FEED_URL || 'https://spacenews.com/feed/' }}
+          WINDOW_HOURS: ${{ vars.WINDOW_HOURS || '12' }}
+        run: python scripts/scrape_spacenews_remote.py

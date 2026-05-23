@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<opml version="2.0">
+    <head>
+        <title>zlzchat订阅列表</title>
+    </head>
+    <body>
+        <outline text="新航天青年说" xmlUrl="http://172.24.144.249:10082/feedAtom/ed538a8d367d09c5281fbd9023762695" type="rss" htmlUrl="http://172.24.144.249:10082/feedAtom/ed538a8d367d09c5281fbd9023762695"/>
+        <outline text="国际太空" xmlUrl="http://172.24.144.249:10082/feedAtom/4baa35d78ffdbb627de2e1260f741983" type="rss" htmlUrl="http://172.24.144.249:10082/feedAtom/4baa35d78ffdbb627de2e1260f741983"/>
+    </body>
+</opml>
