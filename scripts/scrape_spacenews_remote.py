@@ -267,8 +267,9 @@ def main() -> int:
         added_for_source = 0
         for entry in parsed.entries:
             link = entry.get("link", "").strip()
-            if not link or link in seen:
+            if not link:
                 continue
+            # 24h 窗口本身已经是过滤器；seen 仅用于 housekeeping，不再阻断重抓全文。
             t = entry.get("published_parsed") or entry.get("updated_parsed")
             if not t:
                 continue
