@@ -25,6 +25,11 @@ on:
       - '.github/workflows/scrape-spacenews.yml'
   workflow_dispatch:
 
+# 显式声明所需权限；避免账户/仓库默认策略把 GITHUB_TOKEN 权限设成 None
+# 导致 actions/checkout 返回 HTTP 403 (exit code 128) 的问题。
+permissions:
+  contents: read
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
