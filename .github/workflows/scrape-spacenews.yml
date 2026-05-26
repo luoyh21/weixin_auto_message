@@ -15,6 +15,14 @@ on:
     # 2 小时延迟缓冲。本地 WINDOW_HOURS=24，提前抓也不会被过滤。
     - cron: "55 21 * * *"   # 标称 05:55 Beijing（期望实际触发 ≤ 07:55）
     - cron: "55 5 * * *"    # 标称 13:55 Beijing（期望实际触发 ≤ 15:55）
+  # 当抓取脚本或本 workflow 自身有改动并 push 上来时，自动跑一次。
+  # 这样调整代码后无需再到 UI 点 “Run workflow”（该按钮偶尔会报
+  # “Failed to queue workflow run”，本质是 GH 调度通道的瞬时故障）。
+  push:
+    branches: [master, main]
+    paths:
+      - 'scripts/scrape_spacenews_remote.py'
+      - '.github/workflows/scrape-spacenews.yml'
   workflow_dispatch:
 
 jobs:
