@@ -118,20 +118,17 @@ def _fetch_via_jina(target_url: str) -> str | None:
 _JINA_BODY_RE = re.compile(r"Markdown Content:\s*\n", re.I)
 # 命中以下任一行视为正文结束（页面进入 footer / sidebar / 订阅 / 相关阅读 区）
 _JINA_FOOTER_PATTERNS = (
+    # 仅认 markdown 大标题级别的 footer 锚点（避免与 nav 列表里的 [Subscribe] 撞）
     r"^##\s+Related",
     r"^##\s+Subscribe",
     r"^##\s+Gift this article",
     r"^##\s+Complete your transaction",
-    r"^\*?\s*\[Subscribe\]",
-    r"^Subscribe to",
-    r"^Sign up for",
-    r"^Newsletters?$",
-    r"^You may also like",
-    r"^Read more",
-    r"^Tagged:",
-    r"^Filed Under:",
-    r"^© \d{4}",
-    r"^Privacy Policy",
+    r"^##\s+You may also like",
+    r"^##\s+Read more",
+    r"^Tagged:\s",
+    r"^Filed Under:\s",
+    r"^© \d{4}\s",
+    r"^Privacy Policy$",
 )
 _FOOTER_RE = re.compile("|".join(_JINA_FOOTER_PATTERNS), re.I | re.M)
 # 行级噪声：导航菜单 / 广告图链接 / 单纯链接列表
@@ -154,37 +151,43 @@ def _jina_md_to_article_html(md: str, article_title: str = "") -> str:
             pat = re.compile(r"^#\s+.*" + ".*".join(re.escape(t) for t in tokens), re.M | re.I)
             m = pat.search(body)
             if m:
-                body = body[m.end():]
+                # 跳到 H1 整行结束之后再开始正文
+                after = body[m.end():]
+                nl = after.find("\n")
+                body = after[nl + 1:] if nl >= 0 else after
 
-    # 3) 在第一个 footer 标记处截断
+    # 3) 在第一个 footer 标记处截断（保留备份，截太狠时回退）
+    body_full = body
     fm = _FOOTER_RE.search(body)
     if fm:
         body = body[: fm.start()]
 
-    # 4) 按段切分；丢弃明显噪声段
-    paragraphs: list[str] = []
-    for chunk in re.split(r"\n{2,}", body):
-        p = chunk.strip()
-        if not p:
-            continue
-        # 跳过纯图片 / 纯链接 / Nav 列表 / 元数据残留
-        if p.startswith("![") and p.endswith(")"):
-            continue
-        if p.startswith("[") and p.endswith(")") and len(p) < 200:
-            continue
-        if _NAV_LINK_RE.match(p):
-            continue
-        if p.startswith(("Published Time:", "URL Source:", "Title:", "Markdown Content:")):
-            continue
-        if len(p) < 25:
-            continue
-        # 折叠多余空白
-        p = re.sub(r"\s+", " ", p)
-        # 去掉 markdown 行内链接，仅保留链接文字
-        p = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", p)
-        # 去掉强调 markers
-        p = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", p)
-        paragraphs.append(p)
+    def _build_paragraphs(src: str) -> list[str]:
+        out: list[str] = []
+        for chunk in re.split(r"\n{2,}", src):
+            p = chunk.strip()
+            if not p:
+                continue
+            if p.startswith("![") and p.endswith(")"):
+                continue
+            if p.startswith("[") and p.endswith(")") and len(p) < 200:
+                continue
+            if _NAV_LINK_RE.match(p):
+                continue
+            if p.startswith(("Published Time:", "URL Source:", "Title:", "Markdown Content:")):
+                continue
+            if len(p) < 25:
+                continue
+            p = re.sub(r"\s+", " ", p)
+            p = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", p)
+            p = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", p)
+            out.append(p)
+        return out
+
+    paragraphs = _build_paragraphs(body)
+    # footer 截太狠（少于 3 段）时回退到不截断
+    if len(paragraphs) < 3 and len(body_full) > len(body) + 200:
+        paragraphs = _build_paragraphs(body_full)
 
     # 5) 拼成 HTML
     return "".join(f"<p>{p}</p>" for p in paragraphs)
