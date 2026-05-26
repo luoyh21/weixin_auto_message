@@ -1,4 +1,4 @@
-"""海外抓取脚本（建议在 GitHub Actions 或海外 Linux 节点跑）。
+"""海外抓取脚本（建议在 GitHub Actions 或海外 Linux 节点跑）。 
 
 支持多个 RSS 源，默认抓 SpaceNews + NASASpaceflight。两站在国内 IP 都会被
 Cloudflare/BunnyCDN 拒绝，但在 GitHub Actions runner（美国/欧洲出口）一般可以
