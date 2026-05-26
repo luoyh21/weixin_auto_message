@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -78,27 +79,99 @@ def _fetch_with_retry(url: str, max_tries: int = 4, base_sleep: float = 5.0) -> 
 
 
 def _build_mirror_urls(primary_url: str) -> list[str]:
-    """构造一组等价但走不同出口 IP 的 RSS 镜像 URL。
-    主要思路：让第三方公共服务（RSSHub / Google / Wayback）替我们去抓 spacenews，
-    从 spacenews 视角是这些服务的 IP 在请求，绕开 Azure runner IP 段被限流的问题。
-    """
+    """构造一组等价但走不同出口 IP 的 RSS 镜像 URL。"""
     urls = [primary_url]
-    # RSSHub 公共实例（来源 https://docs.rsshub.app/guide/instances）
-    # /rsshub/spacenews 输出与原 feed 兼容（含 description / pubDate）
-    rsshub_path = "/rsshub/spacenews"
-    rsshub_hosts = [
-        "https://rsshub.app",
-        "https://rsshub.rssforever.com",
-        "https://rss.shab.fun",
-        "https://rsshub.pseudoyu.com",
-    ]
-    for h in rsshub_hosts:
-        urls.append(f"{h}{rsshub_path}")
-    # Google web cache（偶尔可用）
-    urls.append(f"https://webcache.googleusercontent.com/search?q=cache:{quote(primary_url, safe='')}")
-    # Wayback Machine 最近快照（必返回最近一次缓存的 feed，不会是实时的，作最末位兜底）
+    # Wayback Machine 最近快照（最稳定，作为高优先级兜底）
     urls.append(f"https://web.archive.org/web/2/{primary_url}")
+    # Google web cache
+    urls.append(f"https://webcache.googleusercontent.com/search?q=cache:{quote(primary_url, safe='')}")
     return urls
+
+
+def _fetch_via_jina(target_url: str) -> str | None:
+    """通过 Jina Reader (https://jina.ai/reader/) 代理抓取 URL，返回 markdown 文本。
+
+    Jina 在其服务端发起请求，能稳定绕开 Cloudflare/BunnyCDN 对 GitHub Actions
+    runner IP 段的拦截。免费、无需 Key，最大单页 ~120KB。
+    """
+    proxy = f"https://r.jina.ai/{target_url}"
+    for attempt in range(1, 4):
+        ua = random.choice(USER_AGENTS)
+        try:
+            r = requests.get(
+                proxy,
+                headers={"User-Agent": ua, "Accept": "text/markdown,text/plain,*/*"},
+                timeout=45,
+            )
+        except requests.RequestException as e:
+            print(f"  [jina try {attempt}/3] {target_url} network error: {e}", file=sys.stderr)
+            time.sleep(3 * attempt)
+            continue
+        if r.status_code == 200 and r.text:
+            return r.text
+        print(f"  [jina try {attempt}/3] {target_url} -> HTTP {r.status_code}", file=sys.stderr)
+        time.sleep(3 * attempt)
+    return None
+
+
+_LINK_RE = re.compile(r"\(https?://[a-z0-9\-./]*spacenews\.com/[a-z0-9\-/]+\)", re.I)
+_NSF_LINK_RE = re.compile(r"\(https?://[a-z0-9\-./]*nasaspaceflight\.com/\d{4}/\d{1,2}/[a-z0-9\-]+/?\)", re.I)
+
+
+def _scrape_via_jina_homepage(source_name: str, homepage: str) -> list[dict]:
+    """RSS 全部失败时，通过 Jina Reader 直接抓首页 → 解析最新文章链接 →
+    再用 Jina 抓每篇文章的 markdown，构造与 RSS 路径一致的 item 列表。
+    """
+    print(f"  Falling back to Jina homepage scrape: {homepage}")
+    md = _fetch_via_jina(homepage)
+    if not md:
+        return []
+    # 选 host 对应的链接抽取规则
+    host_re = _NSF_LINK_RE if "nasaspaceflight" in homepage else _LINK_RE
+    found = []
+    seen = set()
+    for m in host_re.finditer(md):
+        url = m.group(0).strip("()")
+        # 跳过 category / tag / author / page 列表页
+        path = url.split("//", 1)[-1].split("/", 1)[-1]
+        if any(p in path for p in ("/category/", "/tag/", "/author/", "/page/", "#")):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        found.append(url)
+        if len(found) >= 10:
+            break
+    print(f"  Jina parsed {len(found)} article links from homepage")
+    items: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for url in found:
+        body = _fetch_via_jina(url)
+        if not body:
+            continue
+        title = ""
+        for line in body.splitlines():
+            ls = line.strip()
+            if ls.startswith("Title:"):
+                title = ls.split(":", 1)[1].strip()
+                break
+            if ls.startswith("# "):
+                title = ls[2:].strip()
+                break
+        if not title:
+            continue
+        text = " ".join(body.split())
+        items.append({
+            "title": title,
+            "link": url,
+            "published": now.isoformat(),
+            "summary": text[:500],
+            "content_html": "<div>" + body.replace("\n\n", "</p><p>").replace("\n", " ") + "</div>",
+            "image_url": "",
+            "source": source_name,
+        })
+    print(f"  Jina built {len(items)} items via homepage fallback")
+    return items
 
 
 def _fetch_feed(primary_url: str) -> bytes | None:
@@ -180,8 +253,15 @@ def main() -> int:
         print(f"\n=== Fetching [{source_name}] feed: {feed_url} ===")
         feed_bytes = _fetch_feed(feed_url)
         if feed_bytes is None:
-            print(f"  [{source_name}] all feed sources failed (likely rate-limited); skip.",
+            print(f"  [{source_name}] all feed sources failed; trying Jina homepage fallback",
                   file=sys.stderr)
+            # RSS 全军覆没 → 通过 Jina Reader 直接读首页
+            homepage = feed_url.replace("/feed/", "/").replace("/feed", "/")
+            jina_items = _scrape_via_jina_homepage(source_name, homepage)
+            for it in jina_items:
+                if it["link"] in seen:
+                    continue
+                items.append(it)
             continue
         parsed = feedparser.parse(feed_bytes)
         added_for_source = 0
