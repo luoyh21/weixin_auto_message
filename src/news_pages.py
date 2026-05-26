@@ -188,6 +188,29 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 """
 
 
+# 这些站对外部 Referer 严格防盗链：直接 <img src> 会 403
+_HOTLINK_BLOCK_HOSTS = (
+    "nasaspaceflight.com",
+    "www.nasaspaceflight.com",
+)
+
+
+def _proxy_image(url: str) -> str:
+    """对盗链严格的来源走 weserv.nl 公共图片代理（服务端拉图、转发，无 Referer 限制）。"""
+    if not url:
+        return url
+    try:
+        from urllib.parse import urlparse, quote as _q
+        host = urlparse(url).netloc.lower()
+        if any(host == h or host.endswith("." + h) for h in _HOTLINK_BLOCK_HOSTS):
+            # weserv 要求去掉协议头
+            stripped = url.split("://", 1)[-1]
+            return f"https://images.weserv.nl/?url={_q(stripped, safe='')}"
+    except Exception:
+        pass
+    return url
+
+
 def _slugify(text: str, fallback: str) -> str:
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return text[:48] or fallback
@@ -355,7 +378,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             )
 
         hero = item.get("image_url") or item.get("_og") or (item["_imgs"][0] if item["_imgs"] else "")
-        hero_html = f'<img class="hero" src="{html.escape(hero)}" alt="">' if hero else ""
+        hero_display = _proxy_image(hero)
+        hero_html = f'<img class="hero" src="{html.escape(hero_display)}" alt="">' if hero else ""
 
         page_html = _PAGE_TPL.format(
             title_zh=html.escape(title_zh),

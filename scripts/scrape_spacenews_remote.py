@@ -281,6 +281,24 @@ def main() -> int:
             if not content_html:
                 content_html = entry.get("summary", "") or ""
             text = " ".join(BeautifulSoup(content_html, "html.parser").get_text(" ").split())
+            # 如果 RSS 给的是 excerpt（典型 SpaceNews 只放第一段，<2000 字符）
+            # → 用 Jina Reader 拉全文替换
+            if len(text) < 2000:
+                print(f"  short excerpt ({len(text)} chars) for '{entry.get('title','')[:50]}', "
+                      f"fetching full via Jina")
+                full_md = _fetch_via_jina(link)
+                if full_md and len(full_md) > len(text) + 500:
+                    paragraphs = [p.strip() for p in full_md.split("\n\n") if p.strip()]
+                    body_html = "".join(
+                        f"<p>{p}</p>" for p in paragraphs
+                        if not p.startswith(("Title:", "URL Source:", "Markdown Content:", "Image "))
+                    )
+                    # 保留原 RSS 里的封面 figure（含 og 图）
+                    cover_match = re.search(r"<figure[^>]*>.*?</figure>", content_html, re.S | re.I)
+                    cover_html = cover_match.group(0) if cover_match else ""
+                    content_html = cover_html + body_html
+                    text = " ".join(BeautifulSoup(content_html, "html.parser").get_text(" ").split())
+                    print(f"  full article via Jina: {len(text)} chars")
             items.append({
                 "title": entry.get("title", "").strip(),
                 "link": link,
