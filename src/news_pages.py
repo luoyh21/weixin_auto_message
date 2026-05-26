@@ -32,7 +32,14 @@ from .summarizer import client as openai_client
 log = logging.getLogger(__name__)
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "cross-site",
+}
 
 PAGES_ROOT = SETTINGS.cache_dir.parent / "news_pages"
 PAGES_ROOT.mkdir(parents=True, exist_ok=True)
@@ -52,7 +59,16 @@ ARTICLE_DELIM = "###@@@ARTICLE_BREAK@@@###"
     reraise=True,
 )
 def _http_get(url: str) -> requests.Response:
-    r = requests.get(url, headers=HEADERS, timeout=12)
+    # 加上 Referer = 自身 origin，绕开部分站的简单防盗链/直连过滤
+    h = dict(HEADERS)
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        if u.scheme and u.netloc:
+            h["Referer"] = f"{u.scheme}://{u.netloc}/"
+    except Exception:
+        pass
+    r = requests.get(url, headers=h, timeout=12)
     r.raise_for_status()
     return r
 
@@ -236,7 +252,19 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
     fetched: list[dict] = []
     for idx, a in enumerate(articles, 1):
         url = a.get("link", "")
-        item = {**a, "_idx": idx, "_text": "", "_imgs": [], "_og": None}
+        item = {**a, "_idx": idx, "_text": "", "_imgs": [], "_og": None, "_blocked_kind": ""}
+
+        # 0) 远端 ingest 已带回 content_html → 直接用，绝不再回源
+        ingest_html = a.get("content_html") or ""
+        if ingest_html:
+            text, imgs, og = _extract_main_html(ingest_html, url or "")
+            item["_text"] = text
+            item["_imgs"] = imgs
+            item["_og"] = og
+            log.info("use ingest content_html for %s (%d chars text)", url, len(text))
+            fetched.append(item)
+            continue
+
         if not url:
             fetched.append(item)
             continue
@@ -246,8 +274,20 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             item["_text"] = text
             item["_imgs"] = imgs
             item["_og"] = og
+            # 即便 200，也可能是 Cloudflare 的 "Just a moment..." 拦截页
+            if not text:
+                low = (r.text or "").lower()
+                if any(k in low for k in ("just a moment", "cf-chl-", "challenge-platform", "attention required")):
+                    item["_blocked_kind"] = "cloudflare"
         except Exception as e:
-            log.info("fetch %s failed: %s (will keep title-only page)", url, e)
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 403:
+                # 403 多为 Cloudflare/WAF 直接拒绝爬虫
+                item["_blocked_kind"] = "cloudflare"
+            elif status in (429, 451, 503, 520, 521, 522, 523, 524):
+                # 429/5xx/451 多为 CDN 限流或地理拦截，不是 Cloudflare 校验
+                item["_blocked_kind"] = "ratelimit"
+            log.info("fetch %s failed (status=%s): %s", url, status, e)
         fetched.append(item)
 
     # ----- 2. 批量翻译 -----
@@ -283,7 +323,36 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
                 title_zh = zh_text[: first_nl].split(":", 1)[-1].split("：", 1)[-1].strip() or title_zh
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
 
-        body_html = _para_to_html(zh_text) if zh_text else "<p><i>未能抓取到原文正文，请直接访问下方原文链接查看英文版本。</i></p>"
+        if zh_text:
+            body_html = _para_to_html(zh_text)
+        else:
+            kind = item.get("_blocked_kind") or ""
+            if kind == "cloudflare":
+                tip = (
+                    "<b>原文暂无法展示</b><br>"
+                    "该来源站启用了 <b>Cloudflare 自动程序校验</b>（Bot Challenge），"
+                    "我们的服务器请求未能通过人机验证，因此无法渲染中文译文。"
+                    "<br>请点击下方“原文链接”在浏览器中直接打开查看英文原版。"
+                )
+            elif kind == "ratelimit":
+                tip = (
+                    "<b>原文暂无法展示</b><br>"
+                    "该来源站对我们服务器所在的网络段做了访问限流 / 区域拦截"
+                    "（HTTP 429/451/5xx），并非 Cloudflare 人机校验。"
+                    "<br>我们已通过 GitHub Actions 海外节点尝试抓取全文，"
+                    "若本次仍未拿到全文请稍后再试，或点击下方原文链接查看。"
+                )
+            else:
+                tip = (
+                    "<b>未能抓取到原文正文</b><br>"
+                    "请直接访问下方原文链接查看英文版本。"
+                )
+            body_html = (
+                '<div style="background:#fff7e6;border:1px solid #ffd591;'
+                'border-radius:6px;padding:14px 16px;color:#8c4a00;'
+                'font-size:15px;line-height:1.7;">'
+                + tip + "</div>"
+            )
 
         hero = item.get("image_url") or item.get("_og") or (item["_imgs"][0] if item["_imgs"] else "")
         hero_html = f'<img class="hero" src="{html.escape(hero)}" alt="">' if hero else ""

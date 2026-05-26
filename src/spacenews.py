@@ -40,6 +40,7 @@ class Article:
     summary: str
     source: str
     image_url: str = ""
+    content_html: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -118,6 +119,7 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
                     summary=x.get("summary", "") or "",
                     source=x.get("source", "SpaceNews"),
                     image_url=x.get("image_url", "") or "",
+                    content_html=x.get("content_html", "") or "",
                 ))
             log.info("Using ingest data: %d articles", len(arts))
             return arts
@@ -174,6 +176,45 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
         )
         if len(articles) >= max_items:
             break
+
+    # 抓到的条数太少时，自动扩窗口到 24h
+    if len(articles) < 3 and hours < 24:
+        log.info("Only %d items within %dh, widening window to 24h", len(articles), hours)
+        wider_cut = now - timedelta(hours=24)
+        seen_links = {a.link for a in articles}
+        for c in cards:
+            if len(articles) >= max_items:
+                break
+            title_el = c.select_one("h3.card-title")
+            if not title_el:
+                continue
+            metas = c.select("p.card-text.text-muted")
+            source = metas[0].get_text(strip=True) if len(metas) >= 1 else ""
+            pub_raw = metas[1].get_text(strip=True) if len(metas) >= 2 else ""
+            dt = _parse_zh_datetime(pub_raw)
+            if not dt or dt < wider_cut or dt > cutoff:
+                continue
+            link_el = c.find("a", href=True)
+            link = link_el["href"] if link_el else ""
+            if link in seen_links:
+                continue
+            img_url = ""
+            parent = c.parent
+            if parent:
+                img_el = parent.find("img", class_="card-img-top") or parent.find("img")
+                if img_el and img_el.get("src"):
+                    img_url = img_el["src"]
+            articles.append(
+                Article(
+                    title=title_el.get_text(strip=True),
+                    link=link,
+                    published=dt.isoformat(),
+                    summary="",
+                    source=source or "spacelive",
+                    image_url=img_url,
+                )
+            )
+            seen_links.add(link)
 
     if not articles:
         log.info("No items within %dh, falling back to top 5 latest", hours)

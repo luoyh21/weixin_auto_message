@@ -1,14 +1,19 @@
-"""SpaceNews 海外抓取脚本（建议在 GitHub Actions 或海外 Linux 节点跑）。
+"""海外抓取脚本（建议在 GitHub Actions 或海外 Linux 节点跑）。
 
-读取 SpaceNews RSS（https://spacenews.com/feed/，WordPress 默认输出包含 content:encoded
-全文）。如果你启用了 FiveFilters Full-Text RSS / RSSHub，可以通过 FEED_URL 覆盖默认源。
+支持多个 RSS 源，默认抓 SpaceNews + NASASpaceflight。两站在国内 IP 都会被
+Cloudflare/BunnyCDN 拒绝，但在 GitHub Actions runner（美国/欧洲出口）一般可以
+直接拿到 WordPress 默认输出的 content:encoded 全文。
 
 解析 RSS → 提取每条的全文、图片、发布时间 → POST 到你部署在国内的 weixin_auto_message
 服务的 /ingest/spacenews。需要在环境变量里配置：
 
     INGEST_URL        例：http://your.server.cn:8503/ingest/spacenews
     INGEST_TOKEN      与服务端 SPACENEWS_INGEST_TOKEN 一致
-    FEED_URL          可选，默认 https://spacenews.com/feed/
+    FEED_URLS         可选，以英文逗号分隔的多个 RSS。每项可写成
+                      `<source_name>|<url>`，例如
+                          SpaceNews|https://spacenews.com/feed/,NASASpaceflight|https://www.nasaspaceflight.com/feed/
+                      不写 source 段时按 host 推断。
+    FEED_URL          单源向后兼容（与 FEED_URLS 二选一）。
     WINDOW_HOURS      可选，仅推送过去 N 小时内的条目，默认 12
 
 不会重复 POST 已经发过的条目（按 link 比对，写一个 .state.json 在脚本同目录）。
@@ -121,10 +126,37 @@ def _first_img(html_text: str) -> str:
     return ""
 
 
+def _parse_feed_specs() -> list[tuple[str, str]]:
+    """优先用 FEED_URLS（多源），否则回退到 FEED_URL。返回 [(source_name, url)]。"""
+    raw = os.environ.get("FEED_URLS", "").strip()
+    if not raw:
+        single = os.environ.get("FEED_URL", "").strip()
+        if single:
+            raw = single
+        else:
+            raw = ("SpaceNews|https://spacenews.com/feed/,"
+                   "NASASpaceflight|https://www.nasaspaceflight.com/feed/")
+    out: list[tuple[str, str]] = []
+    for spec in raw.split(","):
+        s = spec.strip()
+        if not s:
+            continue
+        if "|" in s:
+            name, url = s.split("|", 1)
+            out.append((name.strip(), url.strip()))
+        else:
+            # 按 host 推断 source 名
+            from urllib.parse import urlparse as _up
+            host = _up(s).netloc.lower()
+            name = "SpaceNews" if "spacenews" in host else \
+                   "NASASpaceflight" if "nasaspaceflight" in host else host
+            out.append((name, s))
+    return out
+
+
 def main() -> int:
     ingest_url = os.environ.get("INGEST_URL")
     token = os.environ.get("INGEST_TOKEN")
-    feed_url = os.environ.get("FEED_URL", "https://spacenews.com/feed/")
     hours = int(os.environ.get("WINDOW_HOURS", "12"))
     if not ingest_url or not token:
         print("Missing INGEST_URL / INGEST_TOKEN", file=sys.stderr)
@@ -138,45 +170,52 @@ def main() -> int:
         except Exception:
             seen = set()
 
-    print(f"Fetching feed (primary={feed_url})")
-    feed_bytes = _fetch_feed(feed_url)
-    if feed_bytes is None:
-        print("All feed sources failed (likely rate-limited). Exiting cleanly so the "
-              "workflow doesn't fail the run.", file=sys.stderr)
-        return 0
-    parsed = feedparser.parse(feed_bytes)
+    feeds = _parse_feed_specs()
+    print(f"Will scrape {len(feeds)} feeds: " + ", ".join(f"{n}({u})" for n, u in feeds))
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
     items: list[dict] = []
-    for entry in parsed.entries:
-        link = entry.get("link", "").strip()
-        if not link or link in seen:
+
+    for source_name, feed_url in feeds:
+        print(f"\n=== Fetching [{source_name}] feed: {feed_url} ===")
+        feed_bytes = _fetch_feed(feed_url)
+        if feed_bytes is None:
+            print(f"  [{source_name}] all feed sources failed (likely rate-limited); skip.",
+                  file=sys.stderr)
             continue
-        t = entry.get("published_parsed") or entry.get("updated_parsed")
-        if not t:
-            continue
-        dt = datetime(*t[:6], tzinfo=timezone.utc)
-        if dt < cutoff:
-            continue
-        content_html = ""
-        if "content" in entry and entry.content:
-            content_html = entry.content[0].get("value", "") or ""
-        if not content_html:
-            content_html = entry.get("summary", "") or ""
-        # 纯文本备份
-        text = " ".join(BeautifulSoup(content_html, "html.parser").get_text(" ").split())
-        items.append({
-            "title": entry.get("title", "").strip(),
-            "link": link,
-            "published": dt.isoformat(),
-            "summary": text[:500],
-            "content_html": content_html,
-            "image_url": _first_img(content_html),
-            "source": "SpaceNews",
-        })
+        parsed = feedparser.parse(feed_bytes)
+        added_for_source = 0
+        for entry in parsed.entries:
+            link = entry.get("link", "").strip()
+            if not link or link in seen:
+                continue
+            t = entry.get("published_parsed") or entry.get("updated_parsed")
+            if not t:
+                continue
+            dt = datetime(*t[:6], tzinfo=timezone.utc)
+            if dt < cutoff:
+                continue
+            content_html = ""
+            if "content" in entry and entry.content:
+                content_html = entry.content[0].get("value", "") or ""
+            if not content_html:
+                content_html = entry.get("summary", "") or ""
+            text = " ".join(BeautifulSoup(content_html, "html.parser").get_text(" ").split())
+            items.append({
+                "title": entry.get("title", "").strip(),
+                "link": link,
+                "published": dt.isoformat(),
+                "summary": text[:500],
+                "content_html": content_html,
+                "image_url": _first_img(content_html),
+                "source": source_name,
+            })
+            added_for_source += 1
+        print(f"  [{source_name}] +{added_for_source} new items "
+              f"(feed had {len(parsed.entries)} entries)")
 
     if not items:
-        print("No new items.")
+        print("No new items across all feeds.")
         return 0
 
     print(f"POST {len(items)} items -> {ingest_url}")

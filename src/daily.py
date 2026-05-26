@@ -13,7 +13,7 @@ from .summarizer import daily_summary
 import os
 import re
 
-from .wecom import send_text, send_image
+from .wecom import send_text, send_image, send_news
 from .news_pages import prepare_news_pages
 
 log = logging.getLogger(__name__)
@@ -62,17 +62,38 @@ def _is_spacenews_source(article: dict) -> bool:
     return ("spacenews" in src) or ("spacenews.com" in img) or ("spacenews.com" in link)
 
 
-def _pick_hero_image(articles: list[dict]) -> str:
-    """挑选封面图：优先 SpaceNews 文章的图，且把 WordPress 缩略图升级为原图。"""
-    # 1) 优先 SpaceNews 来源
+def _pick_hero(articles: list[dict]) -> tuple[dict | None, list[tuple[str, str]]]:
+    """返回 (hero_article, image_candidates)。
+    hero_article: 第一篇带图、被选作首图的文章 dict（含 link/title/...）
+    image_candidates: [(image_url, referer)] 按 SpaceNews 优先的顺序，供上传图片消息时兜底。
+    """
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    hero: dict | None = None
+
+    def _add(a: dict):
+        nonlocal hero
+        url = a.get("image_url") or ""
+        if not url:
+            return
+        full = _upgrade_image_to_full(url)
+        ref = a.get("original_link") or a.get("link") or ""
+        added = False
+        for u in (full, url):
+            if u and u not in seen:
+                out.append((u, ref))
+                seen.add(u)
+                added = True
+        if added and hero is None:
+            hero = a
+
     for a in articles:
-        if _is_spacenews_source(a) and a.get("image_url"):
-            return _upgrade_image_to_full(a["image_url"])
-    # 2) 退化到第一张有图的
+        if _is_spacenews_source(a):
+            _add(a)
     for a in articles:
-        if a.get("image_url"):
-            return _upgrade_image_to_full(a["image_url"])
-    return ""
+        if not _is_spacenews_source(a):
+            _add(a)
+    return hero, out
 
 
 def _split_overview_and_list(summary: str) -> tuple[str, str]:
@@ -147,16 +168,17 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                 # 把翻译页里选定的「主图」回填到文章上，方便后面挑封面
                 if pr.image_url and not a.get("image_url"):
                     a["image_url"] = pr.image_url
-    hero_image_url = _pick_hero_image(sn)
+    hero_article, hero_candidates = _pick_hero(sn)
+    hero_image_url = hero_candidates[0][0] if hero_candidates else ""
 
     date_str = _today_str()
     if not sn and not opml:
-        body = "今日未抓取到任何新文章。"
+        body_md = "今日未抓取到任何新文章。"
     else:
         log.info("Summarizing %d SpaceNews + %d OPML entries with %s (session=%s)", len(sn), len(opml), SETTINGS.openai_model, session_label)
-        body = daily_summary(sn, opml, session_label=session_label)
-    body = _md_links_to_anchor(body)
-    summary = _wrap_header(body, date_str, session_label)
+        body_md = daily_summary(sn, opml, session_label=session_label)
+    summary_md = _wrap_header(body_md, date_str, session_label)
+    summary = _wrap_header(_md_links_to_anchor(body_md), date_str, session_label)
 
     record = {
         "date": date_str,
@@ -169,22 +191,57 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
 
     if send:
         try:
-            # 把 summary 拆成 “总览段” 与 “新闻列表段”，中间塞一条图片消息
             head, tail = _split_overview_and_list(summary)
+            head_md, tail_md = _split_overview_and_list(summary_md)
             results: list[dict] = []
-            results.extend(send_text(head) if head else [])
-            if hero_image_url:
-                img_res = send_image(hero_image_url)
-                if img_res is not None:
-                    results.append(img_res)
-                else:
-                    log.info("hero image send skipped (upload failed)")
-            if tail:
-                results.extend(send_text(tail))
+            # ---------- 1) 横幅 + 总览（text） ----------
+            if head:
+                results.extend(send_text(head))
+            # ---------- 2) news 图文消息：首卡=大图+第一新闻；其余为列表 ----------
+            link_items: list[dict] = [
+                {"cn_title": m.group(1).strip(), "url": m.group(2).strip()}
+                for m in _MD_LINK_RE.finditer(tail_md)
+            ]
+            if hero_article and link_items:
+                hero_url = hero_article.get("link", "")
+                # 把 hero 文章重排到首位
+                link_items.sort(key=lambda x: 0 if x["url"] == hero_url else 1)
+            news_cards: list[dict] = []
+            for i, it in enumerate(link_items[:8]):
+                card: dict = {"title": it["cn_title"][:120], "url": it["url"]}
+                if i == 0 and hero_image_url:
+                    card["picurl"] = hero_image_url
+                news_cards.append(card)
+
+            news_ok = False
+            if news_cards:
+                try:
+                    news_res = send_news(news_cards)
+                    if news_res and news_res.get("errcode") == 0:
+                        results.append(news_res)
+                        news_ok = True
+                    else:
+                        log.warning("send_news non-zero, will fallback: %s", news_res)
+                except Exception as e:
+                    log.exception("send_news raised, will fallback: %s", e)
+
+            # ---------- Fallback: news 失败时再补图+列表（text 总览已发） ----------
+            if not news_ok:
+                log.info("news send failed, fallback to image+text-list flow")
+                if hero_candidates:
+                    img_res = send_image(candidates=hero_candidates)
+                    if img_res is not None:
+                        results.append(img_res)
+                    else:
+                        log.info("hero image send skipped (all %d candidates failed)", len(hero_candidates))
+                if tail:
+                    results.extend(send_text(tail))
+
             ok = all(r.get("errcode") == 0 for r in results) if results else False
             record["sent"] = ok
             record["send_response"] = results
             record["hero_image_url"] = hero_image_url
+            record["used_news_msgtype"] = news_ok
             if not ok:
                 log.error("WeCom send returned non-zero errcode: %s", results)
         except Exception as e:

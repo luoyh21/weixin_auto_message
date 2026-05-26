@@ -21,7 +21,7 @@ if str(ROOT) not in sys.path:
 from vendor import WXBizMsgCrypt  # noqa: E402
 
 from .config import SETTINGS  # noqa: E402
-from .daily import load_latest_cache  # noqa: E402
+from .daily import load_latest_cache, _md_links_to_anchor  # noqa: E402
 from .summarizer import answer_with_context  # noqa: E402
 from .news_pages import page_file, latest_batches  # noqa: E402
 from .ingest import save_ingest, INGEST_TOKEN_ENV  # noqa: E402
@@ -117,6 +117,7 @@ async def receive(request: Request, msg_signature: str, timestamp: str, nonce: s
             cache = load_latest_cache() or {}
             articles = (cache.get("spacenews") or []) + (cache.get("opml") or [])
             reply = answer_with_context(content.strip(), articles)
+            reply = _md_links_to_anchor(reply)
         except Exception as e:
             log.exception("answer failed: %s", e)
             reply = f"抱歉，回答出现异常：{e}"

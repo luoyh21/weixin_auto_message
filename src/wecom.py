@@ -121,15 +121,34 @@ def _normalize_image_to_jpeg(raw: bytes, *, max_side: int = 1600, quality: int =
         return None
 
 
+def _origin_of(url: str) -> str:
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        if u.scheme and u.netloc:
+            return f"{u.scheme}://{u.netloc}/"
+    except Exception:
+        pass
+    return ""
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
-def upload_temp_image(image_url: str, *, max_bytes: int = 9 * 1024 * 1024) -> str | None:
+def upload_temp_image(image_url: str, *, referer: str | None = None, max_bytes: int = 9 * 1024 * 1024) -> str | None:
     """下载 image_url → 统一转 JPEG → 作为「临时素材」上传企业微信，返回 media_id。
 
     企业微信限制 image 临时素材 ≤10MB 且只支持 jpg/png/gif/bmp，
-    我们统一转 JPEG 保证兼容。
+    我们统一转 JPEG 保证兼容。referer 可显式传入，用于绕开盗链 403。
     """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    ref = referer or _origin_of(image_url)
+    if ref:
+        headers["Referer"] = ref
     try:
-        r = requests.get(image_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r = requests.get(image_url, timeout=15, headers=headers)
         r.raise_for_status()
         raw = r.content
     except Exception as e:
@@ -167,9 +186,33 @@ def upload_temp_image(image_url: str, *, max_bytes: int = 9 * 1024 * 1024) -> st
         return None
 
 
-def send_image(image_url: str, to_user: str | None = None) -> dict | None:
-    """便捷封装：上传图片 → 发 image msgtype；失败返回 None。"""
-    media_id = upload_temp_image(image_url)
+def send_image(
+    image_url: str | None = None,
+    to_user: str | None = None,
+    *,
+    candidates: list[tuple[str, str | None]] | None = None,
+) -> dict | None:
+    """便捷封装：上传图片 → 发 image msgtype。
+
+    支持两种调用方式：
+    1. 单图：send_image(image_url, ...)
+    2. 多候选：send_image(candidates=[(url1, ref1), (url2, ref2), ...])
+       依次尝试，第一个上传成功就发出。
+    全部失败返回 None。
+    """
+    tries: list[tuple[str, str | None]] = []
+    if candidates:
+        tries.extend([(u, r) for (u, r) in candidates if u])
+    if image_url:
+        tries.append((image_url, None))
+    media_id = None
+    used_url = None
+    for url, ref in tries:
+        media_id = upload_temp_image(url, referer=ref)
+        if media_id:
+            used_url = url
+            break
+        log.info("send_image: candidate failed, try next: %s", url)
     if not media_id:
         return None
     body = {
@@ -180,7 +223,7 @@ def send_image(image_url: str, to_user: str | None = None) -> dict | None:
         "safe": 0,
     }
     res = _post_message(body)
-    log.info("send_image -> %s", res)
+    log.info("send_image (used %s) -> %s", used_url, res)
     return res
 
 
@@ -205,6 +248,41 @@ def send_text(content: str, to_user: str | None = None) -> list[dict]:
         results.append(_post_message(body))
         log.info("send_text part %d/%d -> %s", idx, total, results[-1])
     return results
+
+
+def send_news(
+    articles: list[dict],
+    to_user: str | None = None,
+) -> dict | None:
+    """发送图文消息（msgtype=news），单条消息内含多张卡片，首张带大图。
+
+    入参 articles 中每个 dict 字段：
+        title:    必填，≤128 字节
+        description: 可选，≤512 字节
+        url:      点击跳转链接，必填
+        picurl:   缩略图绝对 URL；仅首张 article 用大图，其它略
+    最多 8 条，超出自动截断。
+    """
+    if not articles:
+        return None
+    items = []
+    for a in articles[:8]:
+        items.append({
+            "title": (a.get("title") or "")[:120],
+            "description": (a.get("description") or "")[:500],
+            "url": a.get("url") or "",
+            "picurl": a.get("picurl") or "",
+        })
+    body = {
+        "touser": to_user or SETTINGS.to_user,
+        "msgtype": "news",
+        "agentid": SETTINGS.agent_id,
+        "news": {"articles": items},
+        "safe": 0,
+    }
+    res = _post_message(body)
+    log.info("send_news (%d cards) -> %s", len(items), res)
+    return res
 
 
 def send_markdown(content: str, to_user: str | None = None) -> list[dict]:
