@@ -114,6 +114,82 @@ def _fetch_via_jina(target_url: str) -> str | None:
     return None
 
 
+# 文章正文起始：Jina 标准输出里 "Markdown Content:" 之后才是真正的页面 md
+_JINA_BODY_RE = re.compile(r"Markdown Content:\s*\n", re.I)
+# 命中以下任一行视为正文结束（页面进入 footer / sidebar / 订阅 / 相关阅读 区）
+_JINA_FOOTER_PATTERNS = (
+    r"^##\s+Related",
+    r"^##\s+Subscribe",
+    r"^##\s+Gift this article",
+    r"^##\s+Complete your transaction",
+    r"^\*?\s*\[Subscribe\]",
+    r"^Subscribe to",
+    r"^Sign up for",
+    r"^Newsletters?$",
+    r"^You may also like",
+    r"^Read more",
+    r"^Tagged:",
+    r"^Filed Under:",
+    r"^© \d{4}",
+    r"^Privacy Policy",
+)
+_FOOTER_RE = re.compile("|".join(_JINA_FOOTER_PATTERNS), re.I | re.M)
+# 行级噪声：导航菜单 / 广告图链接 / 单纯链接列表
+_NAV_LINK_RE = re.compile(
+    r"^\s*\*\s*\[", re.M  # 列表项链接（多为导航）
+)
+
+
+def _jina_md_to_article_html(md: str, article_title: str = "") -> str:
+    """从 Jina Reader 输出的 markdown 中抽出文章正文，转换为 <p> HTML。"""
+    # 1) 砍掉 Title / URL / Published 等元信息头
+    body_start = _JINA_BODY_RE.search(md)
+    body = md[body_start.end():] if body_start else md
+
+    # 2) 找正文标题（# Title）之后开始
+    if article_title:
+        # 用文章标题前几个词去 markdown 里定位 H1，跳到其之后
+        tokens = [t for t in re.split(r"\s+", article_title) if len(t) >= 3][:4]
+        if tokens:
+            pat = re.compile(r"^#\s+.*" + ".*".join(re.escape(t) for t in tokens), re.M | re.I)
+            m = pat.search(body)
+            if m:
+                body = body[m.end():]
+
+    # 3) 在第一个 footer 标记处截断
+    fm = _FOOTER_RE.search(body)
+    if fm:
+        body = body[: fm.start()]
+
+    # 4) 按段切分；丢弃明显噪声段
+    paragraphs: list[str] = []
+    for chunk in re.split(r"\n{2,}", body):
+        p = chunk.strip()
+        if not p:
+            continue
+        # 跳过纯图片 / 纯链接 / Nav 列表 / 元数据残留
+        if p.startswith("![") and p.endswith(")"):
+            continue
+        if p.startswith("[") and p.endswith(")") and len(p) < 200:
+            continue
+        if _NAV_LINK_RE.match(p):
+            continue
+        if p.startswith(("Published Time:", "URL Source:", "Title:", "Markdown Content:")):
+            continue
+        if len(p) < 25:
+            continue
+        # 折叠多余空白
+        p = re.sub(r"\s+", " ", p)
+        # 去掉 markdown 行内链接，仅保留链接文字
+        p = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", p)
+        # 去掉强调 markers
+        p = re.sub(r"[*_]{1,3}([^*_]+)[*_]{1,3}", r"\1", p)
+        paragraphs.append(p)
+
+    # 5) 拼成 HTML
+    return "".join(f"<p>{p}</p>" for p in paragraphs)
+
+
 _LINK_RE = re.compile(r"\(https?://[a-z0-9\-./]*spacenews\.com/[a-z0-9\-/]+\)", re.I)
 _NSF_LINK_RE = re.compile(r"\(https?://[a-z0-9\-./]*nasaspaceflight\.com/\d{4}/\d{1,2}/[a-z0-9\-]+/?\)", re.I)
 
@@ -289,17 +365,15 @@ def main() -> int:
                       f"fetching full via Jina")
                 full_md = _fetch_via_jina(link)
                 if full_md and len(full_md) > len(text) + 500:
-                    paragraphs = [p.strip() for p in full_md.split("\n\n") if p.strip()]
-                    body_html = "".join(
-                        f"<p>{p}</p>" for p in paragraphs
-                        if not p.startswith(("Title:", "URL Source:", "Markdown Content:", "Image "))
-                    )
-                    # 保留原 RSS 里的封面 figure（含 og 图）
+                    body_html = _jina_md_to_article_html(full_md, entry.get("title", ""))
                     cover_match = re.search(r"<figure[^>]*>.*?</figure>", content_html, re.S | re.I)
                     cover_html = cover_match.group(0) if cover_match else ""
-                    content_html = cover_html + body_html
-                    text = " ".join(BeautifulSoup(content_html, "html.parser").get_text(" ").split())
-                    print(f"  full article via Jina: {len(text)} chars")
+                    if body_html.strip():
+                        content_html = cover_html + body_html
+                        text = " ".join(BeautifulSoup(content_html, "html.parser").get_text(" ").split())
+                        print(f"  full article via Jina: {len(text)} chars")
+                    else:
+                        print("  Jina returned md but could not isolate article body; keep RSS excerpt")
             items.append({
                 "title": entry.get("title", "").strip(),
                 "link": link,
