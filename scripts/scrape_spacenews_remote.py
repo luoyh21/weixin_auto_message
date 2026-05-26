@@ -137,21 +137,46 @@ _NAV_LINK_RE = re.compile(
 )
 
 
-def _jina_md_to_article_html(md: str, article_title: str = "") -> str:
-    """从 Jina Reader 输出的 markdown 中抽出文章正文，转换为 <p> HTML。"""
+# 段落级噪声：包含这些词的段落极可能是站点 nav / 面包屑，drop。
+_NAV_KEYWORDS_RE = re.compile(
+    r"(Subscribe|Sign\s*In|Search\s+for|Menu|Posted in|"
+    r"TOPICS:|Tagged:|Filed Under:|Open dropdown|"
+    r"Newsletters?|Magazine|Webinars?|"
+    r"Skip to (content|main)|Cookie|Privacy Policy|Terms of Use)",
+    re.I,
+)
+# 面包屑：以 "Home /" / "News /" / "Section /" 开头的导航
+_BREADCRUMB_RE = re.compile(r"^(Home|News|Categories?|Section)\s*[\/›>]", re.I)
+
+
+def _jina_md_to_article_html(md: str, article_title: str = "", rss_lede: str = "") -> str:
+    """从 Jina Reader 输出的 markdown 中抽出文章正文，转换为 <p> HTML。
+
+    定位正文起点的优先顺序：① RSS 给的 lede 一句（最稳）② H1 标题。
+    然后在 footer 标记处截断，过段时再过滤段落噪声。
+    """
     # 1) 砍掉 Title / URL / Published 等元信息头
     body_start = _JINA_BODY_RE.search(md)
     body = md[body_start.end():] if body_start else md
 
-    # 2) 找正文标题（# Title）之后开始
-    if article_title:
-        # 用文章标题前几个词去 markdown 里定位 H1，跳到其之后
+    anchored = False
+    # 2a) 优先用 RSS lede 锚定正文起点
+    if rss_lede:
+        # 取 lede 头 50 字 + 至少 15 字的安全锚（去除可能干扰的特殊字符）
+        anchor = re.sub(r"\s+", " ", rss_lede).strip()[:60].strip()
+        if len(anchor) >= 15:
+            pos = body.lower().find(anchor.lower())
+            if pos > 0:
+                body = body[pos:]
+                anchored = True
+
+    # 2b) 退化方案：找 H1，跳到 H1 行末
+    if not anchored and article_title:
         tokens = [t for t in re.split(r"\s+", article_title) if len(t) >= 3][:4]
         if tokens:
             pat = re.compile(r"^#\s+.*" + ".*".join(re.escape(t) for t in tokens), re.M | re.I)
             m = pat.search(body)
             if m:
-                # 跳到 H1 整行结束之后再开始正文
                 after = body[m.end():]
                 nl = after.find("\n")
                 body = after[nl + 1:] if nl >= 0 else after
@@ -176,6 +201,11 @@ def _jina_md_to_article_html(md: str, article_title: str = "") -> str:
                 continue
             if p.startswith(("Published Time:", "URL Source:", "Title:", "Markdown Content:")):
                 continue
+            # 段落含 nav / breadcrumb 关键词 → 丢
+            if _BREADCRUMB_RE.match(p):
+                continue
+            if _NAV_KEYWORDS_RE.search(p) and len(p) < 200:
+                continue
             if len(p) < 25:
                 continue
             p = re.sub(r"\s+", " ", p)
@@ -189,7 +219,6 @@ def _jina_md_to_article_html(md: str, article_title: str = "") -> str:
     if len(paragraphs) < 3 and len(body_full) > len(body) + 200:
         paragraphs = _build_paragraphs(body_full)
 
-    # 5) 拼成 HTML
     return "".join(f"<p>{p}</p>" for p in paragraphs)
 
 
@@ -368,7 +397,9 @@ def main() -> int:
                       f"fetching full via Jina")
                 full_md = _fetch_via_jina(link)
                 if full_md and len(full_md) > len(text) + 500:
-                    body_html = _jina_md_to_article_html(full_md, entry.get("title", ""))
+                    body_html = _jina_md_to_article_html(
+                        full_md, entry.get("title", ""), rss_lede=text,
+                    )
                     cover_match = re.search(r"<figure[^>]*>.*?</figure>", content_html, re.S | re.I)
                     cover_html = cover_match.group(0) if cover_match else ""
                     if body_html.strip():
