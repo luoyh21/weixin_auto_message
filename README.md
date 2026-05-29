@@ -1,12 +1,26 @@
 # weixin_auto_message
 
-每天早上 9 点自动抓取 **SpaceNews** 与 **企业自建 OPML 订阅源** 近一天的新闻，
-调用 OpenAI（默认 `gpt-4.1-mini`，可走代理）生成一份中文「航天每日速递」，
-并通过 **企业微信应用消息** 推送给指定成员。
+每天定时抓取 **SpaceNews / NASASpaceflight / OPML 订阅源** 近一时段的新闻 +
+配置好的 **抖音视频号** 最近发布的作品，调用 OpenAI（默认 `gpt-4.1-mini`，可走代理）
+生成一份中文「航天速递」并通过 **企业微信应用消息** 推送给指定成员。
 
-同时提供一个 FastAPI 服务（默认 `0.0.0.0:8503/weixin`），用于接收企业微信
-后台回调消息，使用 **官方 WXBizMsgCrypt** 完成签名/加解密，再用大模型基于
-**前一日抓取到的新闻原始材料**进行问答回复。
+消息形态：
+- **SpaceNews + 抖音** → `msgtype=mpnews`（企业微信原生图文）一次最多 8 篇，封面、标题、
+  中文译文正文、内嵌图片全部在客户端内直接渲染，**不再有任何外链跳转**；抖音条目以
+  「封面 + 抖音口令文本」原生展示，长按即可选中复制口令再回抖音 App 打开。
+- **公众号** → 单独一条 `msgtype=news` 外链卡片，**点击直接打开 mp.weixin.qq.com 原文**，
+  不经任何中间页（公众号文章本身已是微信原生页，没必要再套一层 mpnews 渲染）。
+
+mpnews 发送失败时自动回退到 `msgtype=news`（外链卡片）+ 本机 `/news/`、`/dy/` 落地页，
+保证不会漏播。所有图片仍走本机 `/img` 代理 + `images.weserv.nl` 兜底，跨客户端一致。
+
+同时提供一个 FastAPI 服务（默认 `0.0.0.0:8503`），挂载以下路由：
+
+- `GET /weixin` / `POST /weixin` —— 企业微信回调接入 + 基于最近一日新闻的 GPT 问答
+- `GET /news/{batch}/{page_id}` —— 国际新闻的中文翻译页（卡片实际跳转目标）
+- `GET /dy/{aweme_id}` —— 抖音作品中转页（App / 浏览器 / 口令 三种打开方式）
+- `GET /img?u=...&r=...` —— 第三方图片代理（统一带 Referer/UA 抓源图、落盘缓存）
+- `POST /ingest/spacenews` —— 远端 scraper（GitHub Actions 等）推送 SpaceNews 全文
 
 ## 目录结构
 
@@ -24,16 +38,22 @@ weixin_auto_message/
 │   └── ierror.py
 ├── src/
 │   ├── config.py              # 读取 .env
-│   ├── wecom.py               # 企业微信应用消息发送
-│   ├── spacenews.py           # spacelive.cn 列表页抓取（聚合 NASA/SpaceNews/...）
+│   ├── wecom.py               # 企业微信应用消息发送（text / image / news / mpnews / markdown + 临时素材上传）
+│   ├── spacenews.py           # ingest 优先 + spacelive.cn 回退；统一过滤栏目/订阅/视频等非文章
 │   ├── verify_server.py       # ★ 仅做企业微信回调 URL 验证的最小服务
 │   ├── opml_feeds.py          # OPML 解析 + 公众号摘要抓取
-│   ├── summarizer.py          # OpenAI 摘要/问答
-│   ├── daily.py               # 每日流程编排 + 缓存
-│   └── server.py              # FastAPI /weixin 服务
+│   ├── summarizer.py          # OpenAI 摘要 / 翻译 / 问答
+│   ├── daily.py               # 每日流程编排 + 缓存（含抖音条目拼装）
+│   ├── ingest.py              # 远端 scraper 推过来的 SpaceNews 全文入库
+│   ├── news_pages.py          # 英文新闻 → 中文翻译页生成器
+│   ├── douyin.py              # 调本机 docker API 抓抖音账号近 N 小时作品
+│   ├── dy_pages.py            # 抖音作品落地页生成器（App/浏览器/口令三选一）
+│   ├── img_proxy.py           # 第三方图片代理 + 预热（拉不到自动回退 weserv，再不行就放弃 picurl）
+│   ├── wx_mp.py               # 公众号 freepublish 封装（草稿/发布/封面/正文图，不群发关注者）
+│   └── server.py              # FastAPI 服务（/weixin /news /dy /img /ingest）
 └── scripts/
-    ├── run_once.py            # 单次运行（用于测试发送）
-    └── run_scheduler.py       # 常驻定时任务（每天 09:00）
+    ├── run_once.py            # 单次运行（手工测试发送，默认只发 LuoYiHe）
+    └── run_scheduler.py       # 常驻定时任务（按 .env 的早/晚两档时点 cron）
 ```
 
 ## 快速开始
@@ -89,7 +109,16 @@ nohup .venv/bin/python -m src.server > logs/server.log 2>&1 &
 | `DAILY_MORNING_HOUR` / `DAILY_MORNING_MINUTE` | 早间速递时间，默认 `08:00`；留空关闭该班次 |
 | `DAILY_EVENING_HOUR` / `DAILY_EVENING_MINUTE` | 晚间速递时间，默认 `17:00`；留空关闭该班次 |
 | `DAILY_TZ` | 时区，默认 `Asia/Shanghai` |
-| `DAILY_WINDOW_HOURS` | 每次抓取覆盖过去 N 小时，默认 `12` |
+| `DAILY_WINDOW_HOURS` | 每次抓取覆盖过去 N 小时，默认 `12`（scheduler 会按早/晚时点之差自动计算实际窗口） |
+| `PUBLIC_BASE_URL` | 对外可达的本服务 base URL，决定卡片里的 `/news /dy /img` 链接，例如 `http://1.2.3.4:8503` |
+| `DOUYIN_API_BASE` | 抖音 API 容器地址，默认 `http://127.0.0.1:8504` |
+| `DOUYIN_USERS` | 抖音账号列表，多个用 `,` 分隔。每项格式 `显示名:sec_user_id` 或仅 `sec_user_id` |
+| `DOUYIN_MAX_TOTAL` | 单次速递最多转发抖音条数，默认 `2`（多账号时全局上限） |
+| `DOUYIN_PER_USER_LIMIT` | 每个账号本次最多取几条最新作品，默认 `1` |
+| `DOUYIN_WINDOW_HOURS` | 抖音抓取时间窗口（小时）；留空则复用 `DAILY_WINDOW_HOURS` |
+| `OPML_MAX_CARDS` | 单次速递中公众号卡片的最大条数，默认 `2` |
+| `WX_MP_APPID` / `WX_MP_APPSECRET` | 公众号 AppID / AppSecret（开发 → 基本配置） |
+| `WX_MP_ENABLED` | `1` = 每次速递同步生成公众号草稿/文章；`0` = 关闭 |
 
 ## 在企业微信后台配置回调（分两步）
 
@@ -151,6 +180,117 @@ POST 时解密用户文本，调用 `gpt-4.1-mini`（以最近一份 `daily_*.js
 ```
 
 `/weixin` 回调时会读取最近一份缓存作为 LLM 的上下文。
+
+## 抖音视频号转发（可选）
+
+部署一个 [`evil0ctal/douyin_tiktok_download_api`](https://github.com/Evil0ctal/Douyin_TikTok_Download_API) 容器即可：
+
+```bash
+# dockerhub 走主流镜像通常 403，可用 1ms.run 镜像
+docker pull docker.1ms.run/evil0ctal/douyin_tiktok_download_api:latest
+docker tag  docker.1ms.run/evil0ctal/douyin_tiktok_download_api:latest \
+            evil0ctal/douyin_tiktok_download_api:latest
+docker run -d --name douyin_api --restart unless-stopped \
+  -p 127.0.0.1:8504:80 evil0ctal/douyin_tiktok_download_api:latest
+```
+
+容器内置 cookie 是匿名状态，对国内账号只能看到部分滞后数据。要拿到真正的最新作品，
+**复制浏览器登录态 Cookie** 后替换容器里的配置：
+
+```bash
+# 1) 在浏览器登录 https://www.douyin.com/，开发者工具复制完整 Cookie 字符串到 /tmp/dy.txt
+# 2) 直接改容器内的 config.yaml（自带 update_cookie 接口对外部 cookie 校验过严）
+docker cp douyin_api:/app/crawlers/douyin/web/config.yaml /tmp/dy_cfg.yaml
+python3 -c "
+import re,sys
+cfg=open('/tmp/dy_cfg.yaml').read()
+cookie=open('/tmp/dy.txt').read().strip()
+open('/tmp/dy_cfg.yaml','w').write(re.sub(r'(\n\s*Cookie:\s*)[^\n]*\n', r'\g<1>'+cookie+'\n', cfg, 1))
+"
+docker cp /tmp/dy_cfg.yaml douyin_api:/app/crawlers/douyin/web/config.yaml
+docker restart douyin_api
+```
+
+> 抖音 `sid_guard` 有效期 60 天，到期后接口会退化到匿名结果，按上面同样办法重新替换一次即可。
+
+`.env` 配置示例：
+
+```env
+DOUYIN_API_BASE=http://127.0.0.1:8504
+DOUYIN_USERS=我们的太空:MS4wLjABAAAA8tYhNulGyT_4NVlSylLBZKvSEkqACthevMPPXbTZgXI
+DOUYIN_MAX_TOTAL=2
+DOUYIN_PER_USER_LIMIT=1
+DOUYIN_WINDOW_HOURS=
+```
+
+转发逻辑：
+- 每个账号取最近 `DOUYIN_PER_USER_LIMIT` 条非置顶作品；
+- 创建时间须落在抓取窗口内，否则该账号本次不参与；
+- 多账号时按时间倒序合并，截断到 `DOUYIN_MAX_TOTAL`；
+- 卡片标题前缀 `[抖音·{显示名}]`，封面图过本机 `/img` 代理；
+- 卡片点击进入本机 `/dy/{aweme_id}` 中转页：同时展示**抖音 App 链接**、**浏览器链接**、**抖音口令文本**三种打开方式，避免企业微信内置浏览器拦截唤起时无路可走。
+
+## 公众号同步（`wx_mp`，可选）
+
+把每次「航天速递」同步成一篇可分享的公众号图文，**走 `freepublish/submit`，
+不会触发群发推送给关注者**，仅生成一条永久 `mp.weixin.qq.com` URL 供后续做卡片 / 外链使用。
+
+### 启用步骤
+
+1. `.env` 填入公众号凭据并打开开关：
+
+   ```env
+   WX_MP_APPID=wxXXXXXXXXXXXXXXXX
+   WX_MP_APPSECRET=********************************
+   WX_MP_ENABLED=1
+   ```
+
+2. 在 [`mp.weixin.qq.com`](https://mp.weixin.qq.com) → **开发 → 基本配置 → IP 白名单**
+   把本服务器出口 IP（`curl -s ifconfig.me`，当前是 `8.130.209.181`）加进白名单，
+   否则所有调用会报 `40164 invalid ip ... not in whitelist`。
+
+3. 重启 `run_scheduler` 让其加载新 `.env`。
+
+### 行为说明
+
+- 每次速递结束后，会用「正文摘要 + 抖音清单 + hero 大图」拼一篇 HTML，
+  通过 `media/uploadimg`（无配额）上传内嵌图、`material/add_material` 上传一张永久封面，
+  再 `draft/add` + `freepublish/submit`。
+- 成功发布时（**认证服务号 / 认证订阅号**）会拿到 `mp.weixin.qq.com/s/...` 永久链接，
+  会作为一条文本附在速递结尾发回到企业微信，且写入 `data/cache/<session>_<date>.json` 的 `wx_mp_url` 字段。
+- **个人未认证订阅号** 没有 `freepublish` 接口权限，会触发 `errcode=48001`。
+  程序会自动退化为「只写入草稿箱」，并发一条提醒到企业微信，
+  你只要登录公众号后台 → **内容管理 → 草稿箱** → 找到最新一篇 → 点 **发表**，
+  微信就会生成永久 mp 链接。
+- 由于「每次都得人工点发表」对自动化体验是个明显回退，**默认 `WX_MP_ENABLED=0` 关闭这条链路**，
+  日常仍走自建 `/news/` 落地页。等账号完成认证、API 直发跑通后再把开关打开即可。
+- 图片上传前用 Pillow 重编码成 baseline JPEG，规避微信对个别 ICC / EXIF 段的
+  `40113 / 40137` 报错；上传过的图按 SHA256 去重，避免重复占用 5000 张永久素材配额。
+
+## 图片代理 `/img`
+
+很多源站（NSF / 抖音 douyinpic / 部分 SpaceNews 子图）对**未带 Referer / 国内 IP**会返
+`403 / 429`。每张卡片的 `picurl` 是接收方客户端各自去拉的——发送方能看见、其他人看不见，
+绝大部分都是这个原因。我们的解决：
+
+1. `src/img_proxy.py::prefetch(url, referer)` 在装卡片前先用服务端身份带 Referer/UA 抓一次源图；
+2. 直接拿不到（NSF / Cloudflare 全段 403、抖音 douyinpic Referer 校验等）就**自动回退**走
+   `images.weserv.nl` 公共图片代理再试一次——绝大部分盗链 / 国内访问问题都能就此搞定；
+3. 两次都拿不到就**不塞 picurl**，避免接收方看到一个「加载失败」灰框；
+4. 抓得到的图落盘到 `data/img_cache/<sha>.bin`；
+5. 卡片上的 `picurl` 全部重写成 `http://<PUBLIC_BASE_URL>/img?u=<src>&r=<referer>`，
+   接收方一律从我们的服务器拉，跨客户端一致。
+
+## 定时窗口
+
+`scripts.run_scheduler` 会根据 `.env` 里的 `DAILY_MORNING_HOUR` / `DAILY_EVENING_HOUR` 自动算出
+每次任务的"真实窗口"——晚间任务覆盖 *早 → 晚*、早间任务覆盖 *昨晚 → 今早*，相邻两次任务
+首尾相接、既不漏播也不重复（旧的固定 `DAILY_WINDOW_HOURS` 仅在缺一档时兜底）。
+
+公众号订阅源独立走另一套节奏：
+- **早间速递**：固定抓过去 24 小时的公众号文章（覆盖昨天 8:00 至今天 8:00 的所有更新）；
+- **晚间速递**：完全跳过公众号，避免一日内重复打扰；
+- **手动 `run_once --session daily`**：保留旧行为，与 SpaceNews 同窗口。
 
 ## 扩展
 

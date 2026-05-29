@@ -115,17 +115,30 @@ def _extract_main_html(html_text: str, base_url: str) -> tuple[str, list[str], s
 # ---------- 批量翻译 ----------
 
 _TRANSLATE_SYS = (
-    "你是专业的航天科技译者。请把用户提交的若干篇英文新闻翻译成自然、流畅、专业准确的简体中文，"
-    "保持段落结构。每篇之间用一个特殊分隔符 `" + ARTICLE_DELIM + "` 分开，翻译结果中也必须用"
-    "同样的分隔符把每篇隔开，且数量与输入完全相同。除翻译外不要输出任何额外说明。"
+    "你是专业的航天科技译者。请把用户提交的若干篇英文新闻**完整地**翻译成自然、流畅、"
+    "专业准确的简体中文。\n"
+    "**硬性要求**：\n"
+    "1. 每一段原文都必须翻译，不得跳过、合并、概括或省略；译文段落数与原文段落数必须一致。\n"
+    "2. 严格保留段落分隔（即译文段落之间也用空行隔开）。\n"
+    "3. 多篇新闻之间用特殊分隔符 `" + ARTICLE_DELIM + "` 分开，译文中必须用同样的分隔符把每篇隔开，"
+    "且数量与输入完全一致（输入有 N 处分隔符 → 输出也必须有 N 处）。\n"
+    "4. 除翻译正文外，不要输出任何额外说明、总结、声明、Markdown 元信息或英文备注。\n"
+    "5. 遇到段落是"
+    "『 By submitting this form, you agree to ... 』『 Sign up for our newsletter 』『 Subscribe / Sign In 』"
+    "等明显是订阅广告 / 服务条款 / Cookie 提示的内容，可以直接丢弃；正文之外的真实段落不得丢。"
 )
 
 
 def _batch_translate(en_blocks: list[str]) -> list[str]:
-    """一次 API 调用翻译多篇，按分隔符切回。"""
+    """一次 API 调用翻译多篇，按分隔符切回。
+
+    为防止 GPT 提前 "Done."，使用 max_tokens 上调 + 检测明显截断后逐篇重试。
+    """
     if not en_blocks:
         return []
     joined = ("\n\n" + ARTICLE_DELIM + "\n\n").join(en_blocks)
+    # gpt-4.1-mini 输出上限 ~16K tokens；按英文 1 token ≈ 0.75 词，中文 1 字 ≈ 1 token，
+    # 一篇 SpaceNews 5K 字符英文 → 译文最多 ~3K 中文字符；多篇合并仍预留充足空间。
     try:
         resp = openai_client().chat.completions.create(
             model=SETTINGS.openai_model,
@@ -134,6 +147,7 @@ def _batch_translate(en_blocks: list[str]) -> list[str]:
                 {"role": "user", "content": joined},
             ],
             temperature=0.2,
+            max_tokens=8192,
         )
         text = resp.choices[0].message.content
     except Exception as e:
@@ -142,13 +156,37 @@ def _batch_translate(en_blocks: list[str]) -> list[str]:
 
     out = [p.strip() for p in text.split(ARTICLE_DELIM)]
     if len(out) != len(en_blocks):
-        log.warning("translate split mismatch %d vs %d, fallback", len(out), len(en_blocks))
-        # 简单兜底：尝试按双换行 + 数量截
-        if len(out) > len(en_blocks):
-            out = out[: len(en_blocks)]
+        log.warning("translate split mismatch %d vs %d, fallback to per-article", len(out), len(en_blocks))
+        out = [_translate_single(b) for b in en_blocks]
+        return out
+
+    # 检测「译文长度异常短」的篇目，逐篇重试
+    fixed: list[str] = []
+    for en, zh in zip(en_blocks, out):
+        if len(zh) < max(120, len(en) * 0.25):
+            log.warning("translation looks truncated (%d vs %d), retry per-article", len(zh), len(en))
+            fixed.append(_translate_single(en))
         else:
-            out = out + en_blocks[len(out):]
-    return out
+            fixed.append(zh)
+    return fixed
+
+
+def _translate_single(en: str) -> str:
+    """单篇翻译，作为批量失败 / 截断时的兜底。"""
+    try:
+        resp = openai_client().chat.completions.create(
+            model=SETTINGS.openai_model,
+            messages=[
+                {"role": "system", "content": _TRANSLATE_SYS},
+                {"role": "user", "content": en},
+            ],
+            temperature=0.2,
+            max_tokens=4096,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        log.exception("single translate failed: %s", e)
+        return en
 
 
 # ---------- HTML 渲染 ----------
@@ -259,6 +297,8 @@ class PageResult:
     page_id: str
     page_path: str  # 相对 /news/ 的 path（带 batch_id）
     image_url: str  # 选定的主图（绝对 URL）
+    title_zh: str = ""   # 中文标题（若翻译失败 = 原文标题）
+    body_zh: str = ""    # 中文正文（纯文本，按段落用 \n\n 分隔；翻译失败为空）
 
 
 def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | None = None) -> dict[str, PageResult]:
@@ -397,6 +437,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             page_id=page_id,
             page_path=page_path,
             image_url=hero,
+            title_zh=title_zh,
+            body_zh=zh_text,
         )
 
     # ----- 4. 轮转 -----

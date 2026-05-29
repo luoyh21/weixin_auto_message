@@ -25,6 +25,7 @@ class OpmlEntry:
     link: str
     published: str
     description: str
+    image_url: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -64,28 +65,36 @@ def _clean_html(html: str, max_len: int = 500) -> str:
 
 _MP_OG_DESC = re.compile(r'<meta[^>]+(?:property|name)=["\']og:description["\'][^>]+content=["\']([^"\']*)["\']', re.I)
 _MP_DESC_VAR = re.compile(r'(?:var\s+msg_desc|msg_desc)\s*=\s*["\']([^"\']+)["\']')
+_MP_OG_IMAGE = re.compile(r'<meta[^>]+(?:property|name)=["\']og:image["\'][^>]+content=["\']([^"\']*)["\']', re.I)
+_MP_COVER_VAR = re.compile(r'(?:var\s+msg_cdn_url|msg_cdn_url)\s*=\s*["\']([^"\']+)["\']')
 
 
-def _fetch_mp_description(url: str) -> str:
-    """对微信公众号文章页面尝试取出 og:description 或 msg_desc 作为摘要。"""
+def _fetch_mp_meta(url: str) -> tuple[str, str]:
+    """对微信公众号文章页面尝试取出 (description, image_url)。"""
     if "mp.weixin.qq.com" not in url:
-        return ""
+        return "", ""
     try:
         r = requests.get(url, headers={"User-Agent": UA}, timeout=15)
         if r.status_code != 200:
-            return ""
+            return "", ""
         html = r.text
+        desc = ""
         m = _MP_OG_DESC.search(html) or _MP_DESC_VAR.search(html)
         if m:
-            return _clean_html(m.group(1))
-        # 退化：取正文第一段
-        soup = BeautifulSoup(html, "lxml")
-        content = soup.find(id="js_content") or soup.find("div", class_="rich_media_content")
-        if content:
-            return _clean_html(str(content), 400)
+            desc = _clean_html(m.group(1))
+        else:
+            soup = BeautifulSoup(html, "lxml")
+            content = soup.find(id="js_content") or soup.find("div", class_="rich_media_content")
+            if content:
+                desc = _clean_html(str(content), 400)
+        img = ""
+        mi = _MP_OG_IMAGE.search(html) or _MP_COVER_VAR.search(html)
+        if mi:
+            img = mi.group(1).strip()
+        return desc, img
     except Exception as e:
-        log.warning("fetch mp desc failed %s: %s", url, e)
-    return ""
+        log.warning("fetch mp meta failed %s: %s", url, e)
+    return "", ""
 
 
 def fetch_opml_recent(hours: int = 48, max_per_feed: int = 10, fetch_desc: bool = True) -> list[OpmlEntry]:
@@ -116,8 +125,12 @@ def fetch_opml_recent(hours: int = 48, max_per_feed: int = 10, fetch_desc: bool 
                 continue
             link = entry.get("link", "").strip()
             desc = _clean_html(entry.get("summary", "") or entry.get("description", ""))
-            if not desc and fetch_desc and link:
-                desc = _fetch_mp_description(link)
+            img = ""
+            if fetch_desc and link:
+                mp_desc, mp_img = _fetch_mp_meta(link)
+                if not desc:
+                    desc = mp_desc
+                img = mp_img
             results.append(
                 OpmlEntry(
                     source=title,
@@ -125,6 +138,7 @@ def fetch_opml_recent(hours: int = 48, max_per_feed: int = 10, fetch_desc: bool 
                     link=link,
                     published=dt.isoformat(),
                     description=desc,
+                    image_url=img,
                 )
             )
             kept += 1

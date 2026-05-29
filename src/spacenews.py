@@ -20,6 +20,66 @@ from .config import SETTINGS
 
 log = logging.getLogger(__name__)
 
+
+# spacelive 的 card 区有时会混入 spacenews.com 自身的"栏目页 / 订阅页 / 视频页"等导航条目；
+# 这些链接 path 极短、没有日期/slug、不是真正的文章。统一过滤掉。
+_JUNK_PATH_HINTS = (
+    "/subscribe",
+    "/section/",
+    "/category/",
+    "/tag/",
+    "/topic/",
+    "/video",
+    "/videos",
+    "/podcast",
+    "/podcasts",
+    "/webinars",
+    "/webinar",
+    "/events",
+    "/about",
+    "/contact",
+    "/sponsored",
+    "/newsletter",
+    "/login",
+    "/register",
+    "/feed",
+    "/sitemap",
+    "/page/",
+    "/author/",
+)
+
+
+def _looks_like_article(url: str) -> bool:
+    """判断一个链接是否像"文章页"（用于过滤栏目首页 / 订阅页 / 视频页等垃圾）。
+
+    规则：
+    - URL 命中 _JUNK_PATH_HINTS 任一片段 → 非文章
+    - path 为空（站点首页）→ 非文章
+    - 末段必须像文章 slug：要么含 4 位年份，要么 slug 较长（≥ 18 字符）
+      且至少有 2 个连字符（spacenews / nasaspaceflight 风格）
+    - 其它情况一律放行（避免误杀）
+    """
+    if not url:
+        return False
+    low = url.lower()
+    for h in _JUNK_PATH_HINTS:
+        if h in low:
+            return False
+    try:
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        segs = [s for s in u.path.split("/") if s]
+        if not segs:
+            return False
+        has_year = any(re.fullmatch(r"\d{4}", s) for s in segs)
+        tail = segs[-1]
+        slug_ok = len(tail) >= 18 and tail.count("-") >= 2
+        if not (has_year or slug_ok):
+            return False
+    except Exception:
+        return True
+    return True
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 HEADERS = {
     "User-Agent": UA,
@@ -109,9 +169,14 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
     try:
         from .ingest import load_recent as load_ingest
         recent = load_ingest(hours=hours)
-        if recent:
+        # 过滤掉远端 scraper 偶尔会推上来的栏目首页 / 订阅页 / 视频页等非文章条目
+        filtered = [x for x in recent if _looks_like_article(x.get("link", ""))]
+        dropped = len(recent) - len(filtered)
+        if dropped:
+            log.info("ingest: dropped %d non-article entries", dropped)
+        if filtered:
             arts: list[Article] = []
-            for x in recent[:max_items]:
+            for x in filtered[:max_items]:
                 arts.append(Article(
                     title=x.get("title", "").strip(),
                     link=x.get("link", "").strip(),
@@ -121,7 +186,7 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
                     image_url=x.get("image_url", "") or "",
                     content_html=x.get("content_html", "") or "",
                 ))
-            log.info("Using ingest data: %d articles", len(arts))
+            log.info("Using ingest data: %d articles (after filter)", len(arts))
             return arts
     except Exception as e:
         log.warning("ingest load failed, fallback to spacelive: %s", e)
@@ -157,6 +222,9 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
             continue
         link_el = c.find("a", href=True)
         link = link_el["href"] if link_el else ""
+        if not _looks_like_article(link):
+            log.info("skip non-article link: %s (%s)", link, title[:40])
+            continue
         # 同一张 card 的 img.card-img-top（封面图）通常在 card-body 的兄弟节点
         img_url = ""
         parent = c.parent
@@ -196,6 +264,8 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
                 continue
             link_el = c.find("a", href=True)
             link = link_el["href"] if link_el else ""
+            if not _looks_like_article(link):
+                continue
             if link in seen_links:
                 continue
             img_url = ""
@@ -229,6 +299,8 @@ def fetch_recent(hours: int = 24, max_items: int = 15, enrich: bool = True) -> l
             dt = _parse_zh_datetime(pub_raw) or now
             link_el = c.find("a", href=True)
             link = link_el["href"] if link_el else ""
+            if not _looks_like_article(link):
+                continue
             img_url = ""
             parent = c.parent
             if parent:

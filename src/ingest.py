@@ -63,10 +63,17 @@ def load_recent(hours: int = 12) -> list[dict]:
                 dt = dt.replace(tzinfo=timezone.utc)
             if dt is None or dt < cutoff:
                 continue
-            # 同 link 取最新
+            # 同 link 去重策略（文件按文件名升序遍历，最新的 ingest 文件最后处理）：
+            #   ① published 更新的胜（罕见，因 RSS 时间稳定）
+            #   ② published 相同时，**总是用更晚一次 ingest 的版本**——让远端
+            #      脚本的逻辑迭代立即反映到本地，避免被旧文件 lock 住。
             cur = merged.get(link)
-            if cur is None or _parse_dt(cur.get("published", "")) < dt:
+            if cur is None:
                 merged[link] = item
+            else:
+                cur_dt = _parse_dt(cur.get("published", ""))
+                if cur_dt is None or cur_dt <= dt:
+                    merged[link] = item
     out = list(merged.values())
     out.sort(key=lambda x: _parse_dt(x.get("published", "")) or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     log.info("ingest load_recent(%dh): %d items", hours, len(out))

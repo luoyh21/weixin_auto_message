@@ -132,6 +132,63 @@ def _origin_of(url: str) -> str:
     return ""
 
 
+def upload_temp_image_bytes(data: bytes, *, filename: str = "img.jpg", max_bytes: int = 9 * 1024 * 1024) -> str | None:
+    """已有图片字节 → 转 JPEG → 上传临时素材，返回 media_id（用作 mpnews thumb_media_id）。"""
+    if not data:
+        return None
+    norm = _normalize_image_to_jpeg(data)
+    if norm is None:
+        norm = data
+    if len(norm) > max_bytes:
+        log.warning("image too large (%d bytes), skip upload", len(norm))
+        return None
+    token = get_access_token()
+    try:
+        resp = requests.post(
+            f"{API}/media/upload",
+            params={"access_token": token, "type": "image"},
+            files={"media": (filename, norm, "image/jpeg")},
+            timeout=30,
+        )
+        j = resp.json()
+        if j.get("errcode") not in (0, None):
+            log.warning("upload temp media failed: %s", j)
+            return None
+        return j.get("media_id")
+    except Exception as e:
+        log.warning("upload temp media error: %s", e)
+        return None
+
+
+def upload_inline_image_bytes(data: bytes, *, filename: str = "img.jpg") -> str | None:
+    """mpnews 正文 <img> 用图（/media/uploadimg），返回企业微信永久图片 URL。
+    单图 ≤2MB，仅 jpg/png；图片只能用于 mpnews 正文。"""
+    if not data:
+        return None
+    norm = _normalize_image_to_jpeg(data, max_side=1600, quality=78) or data
+    if len(norm) > 2 * 1024 * 1024:
+        norm = _normalize_image_to_jpeg(norm, max_side=1200, quality=70) or norm
+    if len(norm) > 2 * 1024 * 1024:
+        log.warning("inline image still too large after re-encode: %d", len(norm))
+        return None
+    token = get_access_token()
+    try:
+        resp = requests.post(
+            f"{API}/media/uploadimg",
+            params={"access_token": token},
+            files={"media": (filename, norm, "image/jpeg")},
+            timeout=30,
+        )
+        j = resp.json()
+        if j.get("errcode", 0) != 0:
+            log.warning("uploadimg failed: %s", j)
+            return None
+        return j.get("url")
+    except Exception as e:
+        log.warning("uploadimg error: %s", e)
+        return None
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=8))
 def upload_temp_image(image_url: str, *, referer: str | None = None, max_bytes: int = 9 * 1024 * 1024) -> str | None:
     """下载 image_url → 统一转 JPEG → 作为「临时素材」上传企业微信，返回 media_id。
@@ -282,6 +339,47 @@ def send_news(
     }
     res = _post_message(body)
     log.info("send_news (%d cards) -> %s", len(items), res)
+    return res
+
+
+def send_mpnews(articles: list[dict], to_user: str | None = None) -> dict | None:
+    """msgtype=mpnews 图文消息（在企业微信内原生渲染、不再外链跳转）。
+
+    入参 articles 每条字段：
+        title: 必填，≤128 字节
+        thumb_media_id: 必填（来自 upload_temp_image_bytes）
+        author: 可选，≤64 字节
+        content_source_url: 可选，「阅读原文」按钮的目标
+        content: HTML 正文（仅可用企业微信支持的有限标签 + uploadimg 返回的 URL）
+        digest: 可选，列表卡片描述
+    最多 8 篇，缺 thumb_media_id 的条目自动丢弃。
+    """
+    if not articles:
+        return None
+    items: list[dict] = []
+    for a in articles[:8]:
+        if not a.get("thumb_media_id"):
+            log.warning("mpnews article missing thumb_media_id, skip: %r", (a.get("title") or "")[:32])
+            continue
+        items.append({
+            "title": (a.get("title") or "")[:120],
+            "thumb_media_id": a["thumb_media_id"],
+            "author": (a.get("author") or "")[:64],
+            "content_source_url": a.get("content_source_url") or "",
+            "content": a.get("content") or "",
+            "digest": (a.get("digest") or "")[:500],
+        })
+    if not items:
+        return None
+    body = {
+        "touser": to_user or SETTINGS.to_user,
+        "msgtype": "mpnews",
+        "agentid": SETTINGS.agent_id,
+        "mpnews": {"articles": items},
+        "safe": 0,
+    }
+    res = _post_message(body)
+    log.info("send_mpnews (%d articles) -> %s", len(items), res)
     return res
 
 
