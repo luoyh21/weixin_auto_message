@@ -1,8 +1,14 @@
 # weixin_auto_message
 
 每天定时抓取 **SpaceNews / NASASpaceflight / OPML 订阅源** 近一时段的新闻 +
-配置好的 **抖音视频号** 最近发布的作品，调用 OpenAI（默认 `gpt-4.1-mini`，可走代理）
-生成一份中文「航天速递」并通过 **企业微信应用消息** 推送给指定成员。
+配置好的 **抖音视频号** 最近发布的作品，**默认完全本地化**：
+
+- 翻译：`deep-translator` → **MyMemory**（中国大陆可直连，无需 key）
+- 总览：`textrank4zh` 抽取式中文摘要（jieba 分词 + TextRank 句子排序）
+
+如需更高质量、或本地缺译/抽取不理想，可通过 `.env` 切到 LLM 兜底
+（`TRANSLATE_USE_LLM=1` / `SUMMARIZER_USE_LLM=1`，默认 `gpt-4.1-mini`，可走代理）。
+最终生成一份中文「航天速递」并通过 **企业微信应用消息** 推送给指定成员。
 
 消息形态：
 - **SpaceNews + 抖音** → `msgtype=mpnews`（企业微信原生图文）一次最多 8 篇，封面、标题、

@@ -1,12 +1,20 @@
-"""调用 OpenAI 兼容接口做摘要 / 问答。"""
+"""每日总览 / 问答：默认走 TextRank（不调用 LLM），可通过 env 切回 GPT。
+
+环境变量：
+- `SUMMARIZER_USE_LLM=1`：daily_summary 走原 GPT 路径（要求 OPENAI_API_KEY 可用）。
+- 缺省（=0）：完全本地化，基于 textrank4zh 做抽取式总览 + 标题清单。
+"""
 from __future__ import annotations
 
 import logging
+import os
+import re
 from typing import Iterable
 
 from openai import OpenAI
 
 from .config import SETTINGS
+from .translate import translate_to_zh, _apply_glossary
 
 log = logging.getLogger(__name__)
 
@@ -88,11 +96,20 @@ def daily_summary(
     opml_entries: list[dict],
     session_label: str = "每日",
 ) -> str:
+    if not spacenews and not opml_entries:
+        return "今日未抓取到任何新文章。"
+    if os.getenv("SUMMARIZER_USE_LLM", "0").strip() == "1":
+        return _daily_summary_llm(spacenews, opml_entries, session_label)
+    return _daily_summary_textrank(spacenews, opml_entries, session_label)
+
+
+def _daily_summary_llm(
+    spacenews: list[dict],
+    opml_entries: list[dict],
+    session_label: str,
+) -> str:
     has_intl = bool(spacenews)
     has_gzh = bool(opml_entries)
-    if not has_intl and not has_gzh:
-        return "今日未抓取到任何新文章。"
-
     if has_intl and has_gzh:
         system_prompt = SYS_DAILY_BOTH
     elif has_intl:
@@ -121,22 +138,165 @@ def daily_summary(
     )
     text = resp.choices[0].message.content.strip()
 
-    # 安全网：强制开头匹配固定前缀。
     prefix = _SESSION_OPENING_PREFIX.get(session_label)
     if prefix:
         lines = text.split("\n", 1)
         first = lines[0].lstrip()
         if not first.startswith(prefix):
-            # 去掉 GPT 自己写的开头短语，再拼上规定前缀
-            import re as _re
-            stripped = _re.sub(r"^[\s『「【\"\'：:,，。.]*", "", first)
-            stripped = _re.sub(
+            stripped = re.sub(r"^[\s『「【\"\'：:,，。.]*", "", first)
+            stripped = re.sub(
                 r"^(今[日晨晚天天]?[航天]*[领]?[领域]?[聚关注盘点回顾速览要事览]+[：:，,]?)\s*",
                 "", stripped,
             )
             lines[0] = prefix + stripped
             text = "\n".join(lines)
     return text
+
+
+# ---------- TextRank 抽取式总览 ----------
+
+
+def _zh_text_for(a: dict) -> str:
+    """返回一条材料用于 TextRank 的中文文本：优先用译文正文，回退到摘要。"""
+    body = (a.get("body_zh") or "").strip()
+    if body:
+        return body
+    summary = (a.get("summary") or a.get("description") or "").strip()
+    if summary:
+        # OPML 摘要本来就是中文；SpaceNews 的 summary 是英文，需现场翻一下用于抽取
+        if re.search(r"[\u4e00-\u9fff]", summary):
+            return summary
+        try:
+            return translate_to_zh(summary)
+        except Exception as e:
+            log.debug("textrank: summary translate failed: %s", e)
+            return ""
+    return ""
+
+
+def _zh_title_for(a: dict) -> str:
+    t = (a.get("title_zh") or "").strip()
+    if t:
+        return t
+    t = (a.get("title") or "").strip()
+    if not t:
+        return ""
+    if re.search(r"[\u4e00-\u9fff]", t):
+        return t
+    try:
+        return translate_to_zh(t).strip()
+    except Exception:
+        return t
+
+
+def _textrank_top_sentences(text: str, num: int = 2) -> list[str]:
+    """从中文长文本里抽 num 句最 representative 的句子。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    try:
+        from textrank4zh import TextRank4Sentence
+    except Exception as e:
+        log.warning("textrank4zh not available: %s", e)
+        # 回退：取前 num 句
+        sents = re.split(r"(?<=[。！？!?])", text)
+        return [s.strip() for s in sents if s.strip()][:num]
+    try:
+        tr = TextRank4Sentence()
+        tr.analyze(text=text, lower=True, source="all_filters")
+        items = tr.get_key_sentences(num=num)
+        return [it.sentence.strip() for it in items if it.sentence.strip()]
+    except Exception as e:
+        log.warning("textrank analyze failed: %s", e)
+        sents = re.split(r"(?<=[。！？!?])", text)
+        return [s.strip() for s in sents if s.strip()][:num]
+
+
+def _truncate_zh(s: str, max_chars: int) -> str:
+    s = s.strip()
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1].rstrip("，。、；：") + "…"
+
+
+def _one_sentence_for(article: dict, max_chars: int = 55) -> str:
+    """从一条材料里抽一句话总结。
+
+    - 优先在译文正文上跑 TextRank 取 top-1 句；
+    - 没有正文（抓取失败）就退回 OPML/spacelive 自带的中文摘要的首句；
+    - 再没有就用标题兜底。
+    """
+    text = _zh_text_for(article)
+    if text:
+        sents = _textrank_top_sentences(text, num=1)
+        if sents:
+            return _truncate_zh(_clean_sentence(sents[0]), max_chars)
+        # TextRank 无结果就退到首句
+        first = re.split(r"(?<=[。！？!?])", text, maxsplit=1)[0]
+        if first.strip():
+            return _truncate_zh(_clean_sentence(first), max_chars)
+    title = _zh_title_for(article)
+    return _truncate_zh(_clean_sentence(title), max_chars) if title else ""
+
+
+def _clean_sentence(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"^[\s—\-—\u2013\u2014『「【\"\'：:,，。.]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.rstrip("。.；;，,")
+
+
+def _daily_summary_textrank(
+    spacenews: list[dict],
+    opml_entries: list[dict],
+    session_label: str,
+) -> str:
+    sn_titles = [_zh_title_for(a) for a in spacenews]
+    gzh_titles = [_zh_title_for(e) for e in opml_entries]
+    sn_links = [a.get("link", "") for a in spacenews]
+    gzh_links = [e.get("link", "") for e in opml_entries]
+
+    # 总览：每条单独抽一句话总结，再用「；」拼起来。
+    # 控制条数（最多 3 条国际 + 2 条公众号），整体不超过 220 字符。
+    overview_pieces: list[str] = []
+    for a in spacenews[:3]:
+        s = _one_sentence_for(a, max_chars=55)
+        if s:
+            overview_pieces.append(s)
+    for e in opml_entries[:2]:
+        s = _one_sentence_for(e, max_chars=55)
+        if s:
+            overview_pieces.append(s)
+
+    if overview_pieces:
+        overview = _apply_glossary("；".join(overview_pieces))
+        overview = _truncate_zh(overview, 220) + "。"
+    else:
+        seeds = [t for t in (sn_titles + gzh_titles) if t][:2]
+        overview = ("、".join(seeds) + "等今日要闻。") if seeds else "今日航天速递。"
+        overview = _apply_glossary(overview)
+
+    prefix = _SESSION_OPENING_PREFIX.get(session_label, "")
+    if prefix and not overview.startswith(prefix):
+        overview = prefix + overview
+
+    lines: list[str] = [overview, ""]
+    if spacenews:
+        lines.append("🌍 国际要闻")
+        for i, (t, url) in enumerate(zip(sn_titles, sn_links), 1):
+            if i > 8:
+                break
+            t = t or url
+            lines.append(f"{i}. [{t}]({url})")
+        lines.append("")
+    if opml_entries:
+        lines.append("📰 公众号精选")
+        for i, (t, url) in enumerate(zip(gzh_titles, gzh_links), 1):
+            if i > 5:
+                break
+            t = t or url
+            lines.append(f"{i}. [{t}]({url})")
+    return "\n".join(lines).strip()
 
 
 SYS_QA = (

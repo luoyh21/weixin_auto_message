@@ -15,6 +15,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+import os
 import re
 import shutil
 import time
@@ -28,6 +29,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from .config import SETTINGS
 from .summarizer import client as openai_client
+from .translate import translate_to_zh
 
 log = logging.getLogger(__name__)
 
@@ -141,15 +143,32 @@ _TRANSLATE_SYS = (
 
 
 def _batch_translate(en_blocks: list[str]) -> list[str]:
-    """一次 API 调用翻译多篇，按分隔符切回。
+    """批量翻译多篇文章。
 
-    为防止 GPT 提前 "Done."，使用 max_tokens 上调 + 检测明显截断后逐篇重试。
+    默认走 `deep-translator` 调用 MyMemory（mainland 可达、无需 key），
+    每篇独立翻译，按段/按句软分块，命中本地缓存直接返回。设置
+    `TRANSLATE_USE_LLM=1` 时退回原 GPT 翻译路径作为兜底（环境允许时质量更高）。
     """
     if not en_blocks:
         return []
+    if os.getenv("TRANSLATE_USE_LLM", "0").strip() == "1":
+        return _batch_translate_llm(en_blocks)
+    out: list[str] = []
+    for en in en_blocks:
+        try:
+            zh = translate_to_zh(en)
+        except Exception as e:
+            log.exception("deep-translator failed for one article: %s", e)
+            zh = en
+        out.append(zh)
+    return out
+
+
+def _batch_translate_llm(en_blocks: list[str]) -> list[str]:
+    """旧的 GPT 批量翻译，作为环境允许时的可选兜底（默认不走）。"""
+    if not en_blocks:
+        return []
     joined = ("\n\n" + ARTICLE_DELIM + "\n\n").join(en_blocks)
-    # gpt-4.1-mini 输出上限 ~16K tokens；按英文 1 token ≈ 0.75 词，中文 1 字 ≈ 1 token，
-    # 一篇 SpaceNews 5K 字符英文 → 译文最多 ~3K 中文字符；多篇合并仍预留充足空间。
     try:
         resp = openai_client().chat.completions.create(
             model=SETTINGS.openai_model,
@@ -163,27 +182,25 @@ def _batch_translate(en_blocks: list[str]) -> list[str]:
         text = resp.choices[0].message.content
     except Exception as e:
         log.exception("batch translate failed: %s", e)
-        return en_blocks  # 翻译失败就降级回原文
+        return en_blocks
 
     out = [p.strip() for p in text.split(ARTICLE_DELIM)]
     if len(out) != len(en_blocks):
         log.warning("translate split mismatch %d vs %d, fallback to per-article", len(out), len(en_blocks))
-        out = [_translate_single(b) for b in en_blocks]
+        out = [_translate_single_llm(b) for b in en_blocks]
         return out
 
-    # 检测「译文长度异常短」的篇目，逐篇重试
     fixed: list[str] = []
     for en, zh in zip(en_blocks, out):
         if len(zh) < max(120, len(en) * 0.25):
             log.warning("translation looks truncated (%d vs %d), retry per-article", len(zh), len(en))
-            fixed.append(_translate_single(en))
+            fixed.append(_translate_single_llm(en))
         else:
             fixed.append(zh)
     return fixed
 
 
-def _translate_single(en: str) -> str:
-    """单篇翻译，作为批量失败 / 截断时的兜底。"""
+def _translate_single_llm(en: str) -> str:
     try:
         resp = openai_client().chat.completions.create(
             model=SETTINGS.openai_model,
@@ -399,7 +416,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             en_index.append(i)
 
     if en_blocks:
-        log.info("translate %d articles in one GPT call", len(en_blocks))
+        log.info("translate %d articles (engine=%s)", len(en_blocks), "LLM" if os.getenv("TRANSLATE_USE_LLM","0").strip()=="1" else "deep-translator/MyMemory")
         zh_blocks = _batch_translate(en_blocks)
         for i, zh in zip(en_index, zh_blocks):
             fetched[i]["_zh"] = zh
@@ -421,6 +438,16 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             if first_nl > 0:
                 title_zh = zh_text[: first_nl].split(":", 1)[-1].split("：", 1)[-1].strip() or title_zh
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
+
+        # 抓取失败的文章没有正文，因此走不到上面的标题拆分，title_zh 还是英文。
+        # 这种情况下单独把标题翻译一次（短，调用 1 次 MyMemory 就够，不浪费配额）。
+        if title_zh and not re.search(r"[\u4e00-\u9fff]", title_zh):
+            try:
+                t = translate_to_zh(title_zh).strip()
+                if t:
+                    title_zh = t
+            except Exception as e:
+                log.debug("title translate failed: %s", e)
 
         zh_text = _strip_author_bio(zh_text)
 

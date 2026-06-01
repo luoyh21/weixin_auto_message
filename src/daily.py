@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -504,7 +505,8 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
     if not sn and not opml:
         body_md = "今日未抓取到任何新文章。"
     else:
-        log.info("Summarizing %d SpaceNews + %d OPML entries with %s (session=%s)", len(sn), len(opml), SETTINGS.openai_model, session_label)
+        _engine = "LLM" if os.getenv("SUMMARIZER_USE_LLM", "0").strip() == "1" else "TextRank"
+        log.info("Summarizing %d SpaceNews + %d OPML entries (engine=%s, session=%s)", len(sn), len(opml), _engine, session_label)
         body_md = daily_summary(sn, opml, session_label=session_label)
     # 用真实文章 URL 修复 GPT 偶尔写错的链接（避免"页面 not found"，并保证后续按 URL 反查封面图能命中）
     known_urls = [a.get("link", "") for a in sn if a.get("link")] + [e.get("link", "") for e in opml if e.get("link")]
@@ -712,8 +714,12 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                     log.exception("send_news raised: %s", e)
 
             # ---- B) 公众号 + 抖音 → 一条外链 news 消息 ----
+            # 故意比 mpnews 晚 ~2s 发送，确保接收端的消息顺序是
+            # 「总览 text → SpaceNews/抖音 mpnews → 公众号 news」，
+            # 避免企业微信 / 微信偶尔把后发的卡片插到前面去。
             if extra_news_cards:
                 try:
+                    time.sleep(2)
                     ex_res = send_news(extra_news_cards)
                     if ex_res and ex_res.get("errcode") == 0:
                         results.append(ex_res)

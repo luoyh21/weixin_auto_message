@@ -10,3 +10,9 @@ uvicorn[standard]>=0.30.0
 pycryptodome>=3.20.0
 tenacity>=8.5.0
 Pillow>=10.0.0
+deep-translator>=1.11.4
+textrank4zh>=0.3
+jieba>=0.42.1
+numpy<2.0
+networkx>=2.0,<3.0  # textrank4zh 仍用 nx.from_numpy_matrix（3.x 已移除）
+scipy>=1.10
