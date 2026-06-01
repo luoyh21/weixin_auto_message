@@ -110,7 +110,7 @@ nohup .venv/bin/python -m src.server > logs/server.log 2>&1 &
 | `DAILY_EVENING_HOUR` / `DAILY_EVENING_MINUTE` | 晚间速递时间，默认 `17:00`；留空关闭该班次 |
 | `DAILY_TZ` | 时区，默认 `Asia/Shanghai` |
 | `DAILY_WINDOW_HOURS` | 每次抓取覆盖过去 N 小时，默认 `12`（scheduler 会按早/晚时点之差自动计算实际窗口） |
-| `PUBLIC_BASE_URL` | 对外可达的本服务 base URL，决定卡片里的 `/news /dy /img` 链接，例如 `http://1.2.3.4:8503` |
+| `PUBLIC_BASE_URL` | 对外可达的本服务 base URL，决定卡片里的 `/news /dy /img` 链接，例如 `http://links.he-ting.com` |
 | `DOUYIN_API_BASE` | 抖音 API 容器地址，默认 `http://127.0.0.1:8504` |
 | `DOUYIN_USERS` | 抖音账号列表，多个用 `,` 分隔。每项格式 `显示名:sec_user_id` 或仅 `sec_user_id` |
 | `DOUYIN_MAX_TOTAL` | 单次速递最多转发抖音条数，默认 `2`（多账号时全局上限） |
@@ -267,6 +267,28 @@ DOUYIN_WINDOW_HOURS=
 - 图片上传前用 Pillow 重编码成 baseline JPEG，规避微信对个别 ICC / EXIF 段的
   `40113 / 40137` 报错；上传过的图按 SHA256 去重，避免重复占用 5000 张永久素材配额。
 
+## 域名 / 反向代理（Cloudflare Tunnel）
+
+业务地址挂在 **`https://links.he-ting.com`**，通过 **Cloudflare Tunnel（cloudflared）** 把
+源站 `localhost:8080` 反代出去——不开任何入站端口、不需要 ICP 备案、自带 HTTPS。
+
+> 为啥不直接挂 80/443：服务器在阿里云大陆区，未备案前阿里云会拦截入站到 80/443 的未备案
+> 域名流量并返回引导页；非标端口（如 8080/8503）虽然不被拦，但企业微信 / 微信内置浏览器
+> 会对非标端口报「无法评估安全性」。Cloudflare Tunnel 把流量从外部 443 端口接进 CF，
+> 再通过 cloudflared 的**出站**长连接把数据送回源站，全程绕过阿里云 80/443 拦截 + 给用户呈现干净的 443 HTTPS。
+
+部署后的关键事实：
+
+- `cloudflared` 已注册为 systemd 服务（`systemctl status cloudflared`）；
+- Cloudflare → Zero Trust → Networks → Tunnels 里只配了一条 ingress：
+  `links.he-ting.com → HTTP → localhost:8080`；
+- DNS：`links.he-ting.com` 在 CF 上是 tunnel 自动管理的 CNAME（不再是 A 记录指向源站 IP）；
+- FastAPI 监听 `0.0.0.0:8080`（`SERVER_PORT=8080`），阿里云安全组也只对外开放 8080
+  作为应急直连入口（`http://8.130.209.181:8080/...` 也能访问，但不建议放到公开消息里）。
+
+`.env` 里 `PUBLIC_BASE_URL=https://links.he-ting.com`，所有抖音落地页 / `/news/` 翻译页 /
+`/img` 代理 URL / GitHub Action `INGEST_URL` 都用这个干净域名。
+
 ## 图片代理 `/img`
 
 很多源站（NSF / 抖音 douyinpic / 部分 SpaceNews 子图）对**未带 Referer / 国内 IP**会返
@@ -305,7 +327,7 @@ DOUYIN_WINDOW_HOURS=
 出口 IP 没加白名单。前往：
 **企业微信后台 → 应用管理 → 你的应用 → 开发者接口 → 企业可信 IP**，
 添加运行本程序的服务器公网 IP（可用 `curl -s ifconfig.me` 查询）。
-本机当前出口 IP：`8.130.209.181`。
+本机当前出口 IP：`8.130.209.181`（同时也是 WeCom IP 白名单与微信公众号 IP 白名单要填的值）。
 
 ### 2. 关于英文航天新闻源
 当前 `src/spacenews.py` 抓取的是 **https://www.spacelive.cn/news**（国内可达），

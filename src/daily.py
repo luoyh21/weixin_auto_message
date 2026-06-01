@@ -172,46 +172,47 @@ def _build_mpnews_content_opml(e: dict, inline_img_url: str) -> tuple[str, str]:
     return content, digest
 
 
-def _build_mpnews_content_dy(d, inline_img_url: str) -> tuple[str, str]:
+def _build_mpnews_content_dy(d, *, landing_base: str) -> tuple[str, str]:
     """抖音作品 → mpnews 正文 HTML + digest。
-    包含：封面 + 描述 + 浏览器播放链接 + 抖音口令（用于回 App 打开）。"""
+
+    正文不再显示任何裸 URL / 口令文本，只放两个按钮形态的 <a>，
+    分别指向落地页的自动复制视图：
+      /dy/<aweme_id>?copy=url   → 自动复制浏览器链接 + 弹窗提示去浏览器粘贴
+      /dy/<aweme_id>?copy=text  → 自动复制抖音口令 + 弹窗提示回抖音 App 搜索
+    """
     import html as _h
     pieces: list[str] = []
     pieces.append(
         f'<p style="color:#8a8f99;font-size:13px;margin:0 0 12px;">'
-        f'来源：抖音·{_h.escape(d.source)} · {_h.escape(d.published)}</p>'
+        f'抖音·{_h.escape(d.source)} · {_h.escape(d.published)}</p>'
     )
-    if inline_img_url:
-        pieces.append(
-            f'<p><img src="{_h.escape(inline_img_url)}" style="max-width:100%;height:auto;"/></p>'
-        )
     if d.desc:
         pieces.append(
-            f'<p style="font-size:16px;line-height:1.75;">{_h.escape(d.desc)}</p>'
+            f'<p style="font-size:16px;line-height:1.75;margin:0 0 18px;">{_h.escape(d.desc)}</p>'
         )
 
-    box_style = (
-        "background:#f5f6f7;padding:12px 14px;border-radius:8px;"
-        "font-size:14px;line-height:1.6;word-break:break-all;"
-        "-webkit-user-select:text;user-select:text;"
+    btn_base = (
+        "display:block;text-align:center;text-decoration:none;"
+        "padding:13px 16px;margin:12px 0 0;border-radius:24px;"
+        "font-size:15px;font-weight:600;letter-spacing:.5px;"
     )
-    hint_style = "margin-top:18px;color:#8a8f99;font-size:13px;"
-    tip_style = "color:#bbb;font-size:12px;margin:6px 2px 0;"
+    btn_primary = btn_base + "background:#ff0050;color:#fff;"
+    btn_secondary = (
+        btn_base + "background:#fff;color:#ff0050;border:1.5px solid #ff0050;"
+    )
+    hint_style = "color:#8a8f99;font-size:12px;text-align:center;margin:8px 4px 0;line-height:1.6;"
 
-    share_url = d.share_url or d.link
-    if share_url:
-        pieces.append(
-            f'<p style="{hint_style}">▶︎ 在浏览器中播放：</p>'
-            f'<p style="{box_style}"><a href="{_h.escape(share_url)}">{_h.escape(share_url)}</a></p>'
-            f'<p style="{tip_style}">企业微信可直接点击打开；在微信中阅读时请长按上方链接选中后复制，再粘贴到浏览器中打开。</p>'
-        )
+    url_link = f"{landing_base}/dy/{_h.escape(d.aweme_id)}?copy=url"
+    text_link = f"{landing_base}/dy/{_h.escape(d.aweme_id)}?copy=text"
+    pieces.append(
+        f'<p><a href="{url_link}" style="{btn_primary}">📋 复制浏览器播放链接</a></p>'
+        f'<p style="{hint_style}">点击后会自动复制视频网页链接，按弹窗提示粘贴到浏览器即可播放。</p>'
+    )
+    pieces.append(
+        f'<p><a href="{text_link}" style="{btn_secondary}">📋 复制抖音口令</a></p>'
+        f'<p style="{hint_style}">点击后会自动复制抖音口令，按弹窗提示回抖音 App 在搜索框粘贴即可跳转该作品。</p>'
+    )
 
-    share = (d.share_text or "").strip()
-    if share:
-        pieces.append(
-            f'<p style="{hint_style}">📨 抖音口令（长按整段选中复制，回到抖音 App 即弹出该视频）：</p>'
-            f'<p style="{box_style}">{_h.escape(share)}</p>'
-        )
     content = "\n".join(pieces)
     digest = (d.desc or d.title or "")[:120]
     return content, digest
@@ -557,17 +558,16 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
             opml_cap = int(os.getenv("OPML_MAX_CARDS", "2") or 2)
             opml_take = opml_link_items[: max(0, opml_cap)]
 
-            # SpaceNews + 抖音 走 mpnews（原生渲染），公众号单独走 msgtype=news
-            # 直接跳到 mp.weixin.qq.com 原文。两路消息分两条发出。
+            # SpaceNews + 抖音 走 mpnews（原生渲染、最多 8 篇）；
+            # 公众号 单独走 msgtype=news 外链卡片消息，直跳 mp.weixin.qq.com。
             mpnews_articles: list[dict] = []      # SpaceNews + 抖音
-            mpnews_cards_fallback: list[dict] = []  # mpnews 失败时回退用的 news 卡片
-            opml_news_cards: list[dict] = []      # 公众号 → 直接外链卡片
+            mpnews_cards_fallback: list[dict] = []  # mpnews 失败时回退用的外链卡片
+            extra_news_cards: list[dict] = []     # 公众号
             sn_by_link = {a.get("link"): a for a in sn}
             opml_by_link = {e.get("link"): e for e in opml}
 
             dy_reserve = min(len(douyin_items), max(0, dy_max))
-            # mpnews 总上限 8 篇：SpaceNews 数 + 抖音数 ≤ 8
-            base_limit = max(0, 8 - dy_reserve)
+            base_limit = max(0, 8 - dy_reserve)  # 抖音占 mpnews 后剩多少给 SpaceNews
 
             def _add_pair(card: dict, mp_article: dict | None) -> None:
                 mpnews_cards_fallback.append(card)
@@ -575,11 +575,20 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                     mpnews_articles.append(mp_article)
 
             # ---- 1) SpaceNews ----
-            for i, it in enumerate(sn_link_items[:base_limit]):
+            # 若该文章抓取/翻译失败（body_zh 为空，正文是英文或仅一段提示），
+            # 直接跳过，用队列里下一篇补上，避免 mpnews 首篇出现英文且无正文的尴尬。
+            sn_taken = 0
+            for it in sn_link_items:
+                if sn_taken >= base_limit:
+                    break
+                sn_a = sn_by_link.get(it["url"], {})
+                if not (sn_a.get("body_zh") or "").strip():
+                    log.info("skip SpaceNews (no zh body, fetch/translate failed): %s", sn_a.get("original_link") or it["url"])
+                    continue
                 card: dict = {"title": it["cn_title"][:120], "url": it["url"]}
                 src_img, src_ref = "", ""
                 pic_pair = sn_pic_map.get(it["url"])
-                if i == 0 and hero_image_url:
+                if sn_taken == 0 and hero_image_url:
                     hero_ref = (hero_article or {}).get("original_link") if hero_article else ""
                     src_img, src_ref = hero_image_url, hero_ref or ""
                 elif pic_pair:
@@ -589,8 +598,6 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                 elif src_img:
                     log.info("drop picurl (prefetch failed): %s", src_img)
 
-                # mpnews：用缓存图作 thumb，无缓存图用占位封面；正文嵌中文译文
-                sn_a = sn_by_link.get(it["url"], {})
                 thumb_bytes = cached_img_bytes(src_img, src_ref) if src_img else None
                 if not thumb_bytes:
                     thumb_bytes = _placeholder_thumb_bytes(it["cn_title"])
@@ -615,28 +622,15 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                         "digest": digest,
                     }
                 _add_pair(card, mp_art)
+                sn_taken += 1
 
-            # ---- 2) 公众号：单独走 msgtype=news，直接跳转 mp.weixin.qq.com，不再过中间页 ----
-            opml_pic_map: dict[str, tuple[str, str]] = {}
-            for e in opml:
-                img = (e.get("image_url") or "").strip()
-                if img:
-                    opml_pic_map[e.get("link", "")] = (img, e.get("link") or "")
-            for it in opml_take:
-                card2: dict = {
-                    "title": f"[公众号] {it['cn_title']}"[:120],
-                    "url": it["url"],  # mp.weixin.qq.com 直链
-                    "description": (opml_by_link.get(it["url"], {}).get("source") or "公众号"),
-                }
-                pp = opml_pic_map.get(it["url"])
-                if pp and prefetch_img(pp[0], pp[1]):
-                    card2["picurl"] = proxy_img(pp[0], pp[1])
-                opml_news_cards.append(card2)
-
-            # ---- 3) 抖音 ----
+            # ---- 2) 抖音 → 回到 mpnews，正文里只放两个跳转按钮（链接由落地页自动复制）----
             for d in douyin_items[:dy_reserve]:
-                ok_pic = bool(d.image_url) and prefetch_img(d.image_url, "https://www.iesdouyin.com/")
-                pic_proxy_url = proxy_img(d.image_url, "https://www.iesdouyin.com/") if ok_pic else ""
+                # 抖音卡片本身不再放图（用户要求），thumb 用极简占位封面
+                thumb_bytes3 = _placeholder_thumb_bytes(f"抖音·{d.source}")
+                thumb_id3 = upload_temp_image_bytes(thumb_bytes3) if thumb_bytes3 else None
+
+                # 准备落地页（带 ?copy=url / ?copy=text 自动复制视图）
                 try:
                     render_dy_landing(
                         d.aweme_id,
@@ -645,36 +639,50 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                         published=d.published,
                         share_text=d.share_text,
                         share_url=d.share_url or d.link,
-                        image_proxy_url=pic_proxy_url,
+                        image_proxy_url="",
                     )
-                    dy_url = f"{_public_base()}/dy/{d.aweme_id}"
                 except Exception as e:
                     log.warning("render dy landing failed for %s: %s", d.aweme_id, e)
-                    dy_url = d.link
-                card3 = {
-                    "title": f"[抖音·{d.source}] {d.title}"[:120],
-                    "description": d.published,
-                    "url": dy_url,
-                    "picurl": pic_proxy_url,
-                }
 
-                thumb_bytes3 = cached_img_bytes(d.image_url, "https://www.iesdouyin.com/") if d.image_url else None
-                if not thumb_bytes3:
-                    thumb_bytes3 = _placeholder_thumb_bytes(f"抖音·{d.source}")
-                thumb_id3 = upload_temp_image_bytes(thumb_bytes3) if thumb_bytes3 else None
-                inline_url3 = upload_inline_image_bytes(thumb_bytes3) if thumb_bytes3 else None
+                dy_landing_url = f"{_public_base()}/dy/{d.aweme_id}"
+                # mpnews 失败时回退用的外链卡片
+                fallback_card3 = {
+                    "title": (d.title or f"抖音·{d.source}")[:120],
+                    "description": d.published,
+                    "url": dy_landing_url,
+                }
                 mp_art3 = None
                 if thumb_id3:
-                    content3, digest3 = _build_mpnews_content_dy(d, inline_url3 or "")
+                    content3, digest3 = _build_mpnews_content_dy(d, landing_base=_public_base())
                     mp_art3 = {
-                        "title": f"[抖音·{d.source}] {d.title}"[:120],
+                        "title": (d.title or f"抖音·{d.source}")[:120],
                         "thumb_media_id": thumb_id3,
                         "author": f"抖音·{d.source}",
-                        "content_source_url": d.share_url or d.link,
+                        "content_source_url": "",  # 不暴露任何外链：让用户走两个按钮
                         "content": content3,
                         "digest": digest3,
                     }
-                _add_pair(card3, mp_art3)
+                _add_pair(fallback_card3, mp_art3)
+
+            # ---- 3) 公众号 → 外链卡片，直跳 mp.weixin.qq.com ----
+            opml_pic_map: dict[str, tuple[str, str]] = {}
+            for e in opml:
+                img = (e.get("image_url") or "").strip()
+                if img:
+                    opml_pic_map[e.get("link", "")] = (img, e.get("link") or "")
+            for it in opml_take:
+                e_obj = opml_by_link.get(it["url"], {})
+                # 标题不再加 [公众号] 前缀，避免被卡片 UI 截断；
+                # 副标题位（description）用作来源名（如"国际太空"）便于辨识。
+                card2: dict = {
+                    "title": (it["cn_title"] or e_obj.get("title") or "")[:120],
+                    "url": it["url"],
+                    "description": e_obj.get("source") or "公众号",
+                }
+                pp = opml_pic_map.get(it["url"])
+                if pp and prefetch_img(pp[0], pp[1]):
+                    card2["picurl"] = proxy_img(pp[0], pp[1])
+                extra_news_cards.append(card2)
 
             news_ok = False
             used_mpnews = False
@@ -703,16 +711,16 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                 except Exception as e:
                     log.exception("send_news raised: %s", e)
 
-            # ---- B) 公众号 → 直链 news 卡片（一条消息）----
-            if opml_news_cards:
+            # ---- B) 公众号 + 抖音 → 一条外链 news 消息 ----
+            if extra_news_cards:
                 try:
-                    op_res = send_news(opml_news_cards)
-                    if op_res and op_res.get("errcode") == 0:
-                        results.append(op_res)
+                    ex_res = send_news(extra_news_cards)
+                    if ex_res and ex_res.get("errcode") == 0:
+                        results.append(ex_res)
                     else:
-                        log.warning("send_news(opml) non-zero: %s", op_res)
+                        log.warning("send_news(extra) non-zero: %s", ex_res)
                 except Exception as e:
-                    log.exception("send_news(opml) raised: %s", e)
+                    log.exception("send_news(extra) raised: %s", e)
 
             # ---------- Fallback: news 失败时再补图+列表（text 总览已发） ----------
             if not news_ok:

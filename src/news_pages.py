@@ -125,7 +125,18 @@ _TRANSLATE_SYS = (
     "4. 除翻译正文外，不要输出任何额外说明、总结、声明、Markdown 元信息或英文备注。\n"
     "5. 遇到段落是"
     "『 By submitting this form, you agree to ... 』『 Sign up for our newsletter 』『 Subscribe / Sign In 』"
-    "等明显是订阅广告 / 服务条款 / Cookie 提示的内容，可以直接丢弃；正文之外的真实段落不得丢。"
+    "等明显是订阅广告 / 服务条款 / Cookie 提示的内容，可以直接丢弃；正文之外的真实段落不得丢。\n"
+    "**专有名词对照表**（遇到下列原文必须按此中文译法，不得改写）：\n"
+    "- Golden Dome / Golden Dome for America / Golden Dome missile defense → **金穹计划**\n"
+    "  （这是 2025 年美国发布的本土反导工程命名，中文官方/媒体一致译作『金穹』，"
+    "  不要写成『金顶』『金顶计划』『金圆顶』等。）\n"
+    "- Iron Dome（以色列防御系统）→ 铁穹\n"
+    "- Space Force / U.S. Space Force → 美国太空军\n"
+    "- Space Development Agency (SDA) → 美国太空发展局\n"
+    "- Space Rapid Capabilities Office (Space RCO) → 太空快速能力办公室\n"
+    "- Artemis（NASA 月球计划）→ 阿尔忒弥斯\n"
+    "- Starship → 星舰；Falcon 9 → 猎鹰 9；Starlink → 星链\n"
+    "- LEO / GEO / MEO → 低轨 / 地球同步轨道 / 中地球轨道"
 )
 
 
@@ -252,6 +263,31 @@ def _proxy_image(url: str) -> str:
 def _slugify(text: str, fallback: str) -> str:
     text = re.sub(r"[^a-zA-Z0-9]+", "-", text).strip("-").lower()
     return text[:48] or fallback
+
+
+_BIO_PAT = re.compile(
+    r"(更多[\s\u4e00-\u9fa5A-Za-z·\.\-]{1,40}作品|"
+    r"\.\.\.\s*更多.{1,40}作品|"
+    r"…+\s*更多.{1,40}作品)"
+)
+_BIO_HINT = re.compile(r"(报道|记者|编辑|曾任|供职|博士|硕士|学士|毕业于|涉及|涵盖)")
+
+
+def _strip_author_bio(text: str) -> str:
+    """剥离 SpaceNews 风格的作者署名段（『XX 报道……更多 XX 作品』）。
+
+    译文末尾常出现 1~2 段记者介绍，对正文阅读无意义，按段尾启发式删掉。
+    """
+    if not text:
+        return text
+    paras = [p for p in re.split(r"\n{2,}", text) if p.strip()]
+    while paras:
+        last = paras[-1]
+        if _BIO_PAT.search(last) or (_BIO_HINT.search(last) and len(last) < 220 and ("·" in last or "记者" in last or "编辑" in last)):
+            paras.pop()
+            continue
+        break
+    return "\n\n".join(paras).strip()
 
 
 def _para_to_html(text: str) -> str:
@@ -385,6 +421,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             if first_nl > 0:
                 title_zh = zh_text[: first_nl].split(":", 1)[-1].split("：", 1)[-1].strip() or title_zh
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
+
+        zh_text = _strip_author_bio(zh_text)
 
         if zh_text:
             body_html = _para_to_html(zh_text)
