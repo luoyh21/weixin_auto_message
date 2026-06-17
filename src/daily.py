@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -17,8 +18,10 @@ from .wecom import (
     send_text, send_image, send_news, send_mpnews,
     upload_temp_image_bytes, upload_inline_image_bytes,
 )
-from .news_pages import prepare_news_pages
+from .news_pages import prepare_news_pages, to_beijing
+from .extra_news import fetch_all as fetch_extra_news
 from .douyin import fetch_douyin_recent
+from . import tagging, dedup
 from .img_proxy import proxify as proxy_img, prefetch as prefetch_img, cached_bytes as cached_img_bytes
 from .dy_pages import render_landing as render_dy_landing
 from . import wx_mp
@@ -28,6 +31,43 @@ log = logging.getLogger(__name__)
 
 def _today_str() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def _source_bucket(a: dict) -> str:
+    """把一篇国际新闻归入三源之一：SpaceNews / NASA / ESA。"""
+    s = (a.get("source") or "").strip().upper()
+    if s == "NASA":
+        return "NASA"
+    if s == "ESA":
+        return "ESA"
+    return "SpaceNews"  # SpaceNews / NASASpaceflight / spacelive 等聚合源
+
+
+def _even_split(groups: dict[str, list], total: int) -> list:
+    """三源轮转取数，尽量均分到 total 条（各源内部保持原序）。"""
+    order = ["SpaceNews", "NASA", "ESA"]
+    queues = {k: list(groups.get(k, [])) for k in order}
+    out: list = []
+    while len(out) < total and any(queues[k] for k in order):
+        for k in order:
+            if len(out) >= total:
+                break
+            if queues[k]:
+                out.append(queues[k].pop(0))
+    return out
+
+
+def _chunk_balanced(items: list, limit: int = 8) -> list[list]:
+    """把 items 切成每条 ≤limit 的若干块，块数最少且尽量均衡（如 12→6+6，14→7+7）。"""
+    import math
+    n = len(items)
+    if n == 0:
+        return []
+    if n <= limit:
+        return [items]
+    msgs = math.ceil(n / limit)
+    size = math.ceil(n / msgs)
+    return [items[i:i + size] for i in range(0, n, size)]
 
 
 _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
@@ -111,6 +151,19 @@ def _para_html(text: str) -> str:
     return "\n".join(f"<p>{_h.escape(p)}</p>" for p in parts)
 
 
+def _tag_line_html(tags: list[str]) -> str:
+    """正文开头的标签行 HTML（全部标签）。"""
+    if not tags:
+        return ""
+    import html as _h
+    spans = "".join(
+        f'<span style="display:inline-block;background:#eef2ff;color:#1664ff;font-size:13px;'
+        f'padding:2px 10px;border-radius:12px;margin:0 6px 6px 0;">#{_h.escape(t)}</span>'
+        for t in tags
+    )
+    return f'<p style="margin:0 0 10px;">{spans}</p>'
+
+
 def _build_mpnews_content_sn(
     *,
     title_zh: str,
@@ -119,13 +172,16 @@ def _build_mpnews_content_sn(
     published: str,
     inline_img_url: str,
     original_link: str,
+    tags: list[str] | None = None,
 ) -> tuple[str, str]:
     """SpaceNews 文章 → mpnews 正文 HTML + digest。"""
     import html as _h
     pieces: list[str] = []
+    if tags:
+        pieces.append(_tag_line_html(tags))
     pieces.append(
         f'<p style="color:#8a8f99;font-size:13px;margin:0 0 12px;">'
-        f'来源：{_h.escape(source or "SpaceNews")} · {_h.escape(published or "")}</p>'
+        f'来源：{_h.escape(source or "SpaceNews")} · {_h.escape(to_beijing(published or ""))}</p>'
     )
     if inline_img_url:
         pieces.append(
@@ -153,7 +209,7 @@ def _build_mpnews_content_opml(e: dict, inline_img_url: str) -> tuple[str, str]:
     pub = e.get("published") or ""
     pieces.append(
         f'<p style="color:#8a8f99;font-size:13px;margin:0 0 12px;">'
-        f'来源：{_h.escape(src)} · {_h.escape(pub)}</p>'
+        f'来源：{_h.escape(src)} · {_h.escape(to_beijing(pub))}</p>'
     )
     if inline_img_url:
         pieces.append(
@@ -184,7 +240,7 @@ def _build_mpnews_content_dy(d, *, landing_base: str) -> tuple[str, str]:
     pieces: list[str] = []
     pieces.append(
         f'<p style="color:#8a8f99;font-size:13px;margin:0 0 12px;">'
-        f'抖音·{_h.escape(d.source)} · {_h.escape(d.published)}</p>'
+        f'抖音·{_h.escape(d.source)} · {_h.escape(to_beijing(d.published))}</p>'
     )
     if d.desc:
         pieces.append(
@@ -407,6 +463,74 @@ def load_latest_cache() -> dict | None:
         return None
 
 
+def _promo_news_card() -> dict:
+    """订阅引导做成「外链卡片」，比正文里的 <a> 链接更不易被企业微信过滤，且可点。
+
+    点击进入 /join 页（展示微信插件关注二维码），卡片缩略图直接用 /join.png。
+    """
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or _public_base_raw()
+    return {
+        "title": "📡 订阅 · 邀同好接收每日航天速递",
+        "description": "两步开通：① 微信授权一键加入 ② 关注微信插件，点开查看",
+        "url": f"{base}/join",
+        "picurl": f"{base}/join.png",
+    }
+
+
+def _promo_mpnews_article() -> tuple[dict, dict | None]:
+    """订阅引导做成 mpnews 文章（可并入主图文消息当最后一栏，原生渲染含两张二维码）。
+
+    返回 (外链卡片回退, mpnews 文章)；mpnews 构建失败时第二项为 None。
+    """
+    card = _promo_news_card()
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or _public_base_raw()
+    try:
+        from .join_qr import ensure_qrcode, IMG_FILE as PLUGIN_IMG
+        ensure_qrcode()
+
+        thumb_bytes = PLUGIN_IMG.read_bytes() if PLUGIN_IMG.exists() else _placeholder_thumb_bytes("订阅航天速递")
+        thumb_id = upload_temp_image_bytes(thumb_bytes) if thumb_bytes else None
+        if not thumb_id:
+            return card, None
+
+        pl_inline = upload_inline_image_bytes(PLUGIN_IMG.read_bytes()) if PLUGIN_IMG.exists() else ""
+
+        def _img(u: str) -> str:
+            return f'<p style="text-align:center;"><img src="{u}" style="max-width:62%;height:auto;"/></p>' if u else ""
+
+        content = (
+            '<p style="color:#8a8f99;font-size:13px;margin:0 0 12px;">订阅 · 每日航天速递</p>'
+            '<p style="font-size:16px;line-height:1.8;margin:0 0 16px;">'
+            '把这条转给同好，按两步即可在微信里每天收到航天要闻速递：</p>'
+            '<p style="font-size:15px;font-weight:600;margin:0 0 4px;">第一步 · 加入企业</p>'
+            '<p style="color:#8a8f99;font-size:13px;margin:0 0 10px;">'
+            f'打开下方订阅页，点「微信一键加入」按微信授权用绑定手机号加入（成为成员才能收推送）。</p>'
+            f'<p style="margin:0 0 18px;"><a href="{base}/join">👉 点此打开订阅页，第一步微信授权加入</a></p>'
+            '<p style="font-size:15px;font-weight:600;margin:18px 0 4px;">第二步 · 关注微信插件</p>'
+            '<p style="color:#8a8f99;font-size:13px;margin:0 0 8px;">'
+            '完成第一步后再扫此码，在微信里接收消息（已加入企业不会再要求验证手机号）</p>'
+            f'{_img(pl_inline)}'
+            f'<p style="margin-top:22px;border-top:1px solid #eee;padding-top:12px;">'
+            f'<a href="{base}/join">打开网页版订阅页（二维码更清晰、可放大）</a></p>'
+        )
+        article = {
+            "title": card["title"][:120],
+            "thumb_media_id": thumb_id,
+            "author": "航天速递",
+            "content_source_url": f"{base}/join",
+            "content": content,
+            "digest": card["description"][:120],
+        }
+        return card, article
+    except Exception as e:
+        log.warning("build promo mpnews failed, fallback to link card: %s", e)
+        return card, None
+
+
+def _public_base_raw() -> str:
+    return f"http://{SETTINGS.server_host if SETTINGS.server_host != '0.0.0.0' else '127.0.0.1'}:{SETTINGS.server_port}"
+
+
 def _public_base() -> str:
     """中文翻译页对外的 base URL，默认按服务器 host+port 拼。"""
     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
@@ -426,12 +550,23 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
     log.info("=== %s run start (window=%dh) ===", session_label, hrs)
     sn = [a.to_dict() for a in fetch_spacenews(hours=hrs)]
 
+    # ----- 额外英文新闻源：NASA + ESA 官网 RSS（与 SpaceNews 同流程处理） -----
+    try:
+        extra = fetch_extra_news(hours=hrs)
+        if extra:
+            existing_links = {a.get("link", "") for a in sn}
+            extra = [x for x in extra if x.get("link") and x["link"] not in existing_links]
+            sn.extend(extra)
+            log.info("added %d NASA/ESA articles (sn total=%d)", len(extra), len(sn))
+    except Exception as e:
+        log.exception("fetch NASA/ESA failed: %s", e)
+
     # 公众号订阅按"早间一次性覆盖昨天到今天 24h"的策略：
     # - 早间速递：固定取过去 24 小时（覆盖前一天 8:00 至当天 8:00 这段所有更新）
     # - 晚间速递：完全不发公众号（避免一日内重复且打扰）
     # - 其它（手工 run_once --session daily 等）：复用 SpaceNews 同窗口
     if session_key == "morning":
-        opml_hours = 24
+        opml_hours = int(os.getenv("OPML_MORNING_HOURS", "24") or 24)
     elif session_key == "evening":
         opml_hours = 0
     else:
@@ -441,6 +576,13 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
     else:
         log.info("opml skipped this session (%s)", session_key)
         opml = []
+
+    # ----- 去重：剔除「上次推送之前 / 已推过 / 与历史高度雷同」的条目，再去同次跨源重复 -----
+    last_push = dedup.last_push_at()
+    log.info("dedup: last_push_at=%s; before: sn=%d opml=%d", last_push, len(sn), len(opml))
+    sn = dedup.dedup_within(dedup.filter_new(sn))
+    opml = dedup.dedup_within(dedup.filter_new(opml))
+    log.info("dedup: after: sn=%d opml=%d", len(sn), len(opml))
 
     # ----- 为国际新闻生成中文翻译页，并把链接重写到 /news/... -----
     batch_id = f"{session_key}_{datetime.now().strftime('%Y-%m-%d')}"
@@ -462,6 +604,8 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                     a["title_zh"] = pr.title_zh
                 if pr.body_zh:
                     a["body_zh"] = pr.body_zh
+                if pr.tags:
+                    a["tags"] = pr.tags
     hero_article, hero_candidates = _pick_hero(sn)
     hero_image_url = hero_candidates[0][0] if hero_candidates else ""
 
@@ -498,11 +642,20 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
         except Exception as e:
             log.warning("douyin demo inject failed: %s", e)
 
+    # 抖音同样去重（按 link/标题/发布时间）
+    if douyin_items:
+        _dy_tmp = [{"link": d.link, "title": d.title, "published": d.published, "_obj": d} for d in douyin_items]
+        _dy_tmp = dedup.filter_new(_dy_tmp)
+        douyin_items = [x["_obj"] for x in _dy_tmp]
+
     douyin_dicts = [d.to_dict() for d in douyin_items]
 
     date_str = _today_str()
-    if not sn and not opml:
-        body_md = "今日未抓取到任何新文章。"
+    if not sn:
+        # 没有"网页抓取"的国际新闻：不写总览，也不输出"今日未抓取到任何新文章"，
+        # 只保留速递第一句（横幅）。公众号/抖音(若有)仍照常作为卡片发出；
+        # 若三者皆空，后续 has_real_content 判定会整条跳过不发。
+        body_md = ""
     else:
         log.info("Summarizing %d SpaceNews + %d OPML entries with %s (session=%s)", len(sn), len(opml), SETTINGS.openai_model, session_label)
         body_md = daily_summary(sn, opml, session_label=session_label)
@@ -524,246 +677,248 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
 
     if send:
         try:
-            head, tail = _split_overview_and_list(summary)
-            head_md, tail_md = _split_overview_and_list(summary_md)
+            CARD_LIMIT = 8  # 企业微信单条 news/mpnews 硬上限
             results: list[dict] = []
-            # ---------- 1) 横幅 + 总览（text） ----------
-            if head:
-                results.extend(send_text(head))
-            # ---------- 2) news 图文消息：首卡=大图+第一新闻；其余为列表 ----------
-            link_items: list[dict] = [
-                {"cn_title": m.group(1).strip(), "url": m.group(2).strip()}
-                for m in _MD_LINK_RE.finditer(tail_md)
-            ]
-            if hero_article and link_items:
-                hero_url = hero_article.get("link", "")
-                # 把 hero 文章重排到首位
-                link_items.sort(key=lambda x: 0 if x["url"] == hero_url else 1)
-            # 反查每篇 SpaceNews 文章的封面与 Referer（按重写后的本机 /news/... 链接索引）
-            sn_pic_map: dict[str, tuple[str, str]] = {}
+
+            # ---------- 国际新闻：三源(SpaceNews/NASA/ESA)均分 → mpnews ----------
+            # 卡片直接由抓取+翻译成功的文章生成（不依赖 GPT 列表），便于按来源均分。
+            groups: dict[str, list[dict]] = {"SpaceNews": [], "NASA": [], "ESA": []}
             for a in sn:
-                img = _upgrade_image_to_full(a.get("image_url") or "")
-                if not img:
+                if not a.get("link"):
                     continue
-                ref = a.get("original_link") or a.get("link") or ""
-                sn_pic_map[a.get("link", "")] = (img, ref)
-
-            # 卡片名额分配（总上限 8）：
-            #   - 公众号 优先，最多 OPML_MAX_CARDS（默认 2）；
-            #   - 抖音 次之，最多 DOUYIN_MAX_TOTAL；
-            #   - 剩余给 SpaceNews。
-            # 展示顺序：新闻 → 公众号 → 抖音。
-            opml_link_items: list[dict] = [it for it in link_items if "mp.weixin.qq.com" in it["url"]]
-            sn_link_items: list[dict] = [it for it in link_items if "mp.weixin.qq.com" not in it["url"]]
-            opml_cap = int(os.getenv("OPML_MAX_CARDS", "2") or 2)
-            opml_take = opml_link_items[: max(0, opml_cap)]
-
-            # SpaceNews + 抖音 走 mpnews（原生渲染、最多 8 篇）；
-            # 公众号 单独走 msgtype=news 外链卡片消息，直跳 mp.weixin.qq.com。
-            mpnews_articles: list[dict] = []      # SpaceNews + 抖音
-            mpnews_cards_fallback: list[dict] = []  # mpnews 失败时回退用的外链卡片
-            extra_news_cards: list[dict] = []     # 公众号
-            sn_by_link = {a.get("link"): a for a in sn}
-            opml_by_link = {e.get("link"): e for e in opml}
-
-            dy_reserve = min(len(douyin_items), max(0, dy_max))
-            base_limit = max(0, 8 - dy_reserve)  # 抖音占 mpnews 后剩多少给 SpaceNews
-
-            def _add_pair(card: dict, mp_article: dict | None) -> None:
-                mpnews_cards_fallback.append(card)
-                if mp_article is not None:
-                    mpnews_articles.append(mp_article)
-
-            # ---- 1) SpaceNews ----
-            # 若该文章抓取/翻译失败（body_zh 为空，正文是英文或仅一段提示），
-            # 直接跳过，用队列里下一篇补上，避免 mpnews 首篇出现英文且无正文的尴尬。
-            sn_taken = 0
-            for it in sn_link_items:
-                if sn_taken >= base_limit:
-                    break
-                sn_a = sn_by_link.get(it["url"], {})
-                if not (sn_a.get("body_zh") or "").strip():
-                    log.info("skip SpaceNews (no zh body, fetch/translate failed): %s", sn_a.get("original_link") or it["url"])
+                if not (a.get("body_zh") or "").strip():
+                    log.info("skip intl (no zh body): %s", a.get("original_link") or a.get("link"))
                     continue
-                card: dict = {"title": it["cn_title"][:120], "url": it["url"]}
-                src_img, src_ref = "", ""
-                pic_pair = sn_pic_map.get(it["url"])
-                if sn_taken == 0 and hero_image_url:
-                    hero_ref = (hero_article or {}).get("original_link") if hero_article else ""
-                    src_img, src_ref = hero_image_url, hero_ref or ""
-                elif pic_pair:
-                    src_img, src_ref = pic_pair
+                groups[_source_bucket(a)].append(a)
+            selected = _even_split(groups, max(1, SETTINGS.news_max_total))
+            log.info(
+                "intl cards: SpaceNews=%d NASA=%d ESA=%d -> selected=%d (max=%d)",
+                len(groups["SpaceNews"]), len(groups["NASA"]), len(groups["ESA"]),
+                len(selected), SETTINGS.news_max_total,
+            )
+            record["intl_counts"] = {k: len(v) for k, v in groups.items()}
+            record["intl_selected"] = len(selected)
+
+            hero_ref0 = (hero_article or {}).get("original_link") if hero_article else ""
+
+            def _build_intl(a: dict, use_hero: bool) -> tuple[dict, dict | None]:
+                title = (a.get("title_zh") or a.get("title") or "").strip()
+                tags = a.get("tags") or tagging.tags_for(title, scope="国际新闻")
+                titled = (tagging.tag_prefix(tags) + title).strip()  # 标题只放一个标签
+                card: dict = {"title": titled[:120], "url": a.get("link", "")}
+                src_img = _upgrade_image_to_full(a.get("image_url") or "")
+                src_ref = a.get("original_link") or a.get("link") or ""
+                if use_hero and hero_image_url:
+                    src_img, src_ref = hero_image_url, (hero_ref0 or src_ref)
                 if src_img and prefetch_img(src_img, src_ref):
                     card["picurl"] = proxy_img(src_img, src_ref)
-                elif src_img:
-                    log.info("drop picurl (prefetch failed): %s", src_img)
-
                 thumb_bytes = cached_img_bytes(src_img, src_ref) if src_img else None
                 if not thumb_bytes:
-                    thumb_bytes = _placeholder_thumb_bytes(it["cn_title"])
+                    thumb_bytes = _placeholder_thumb_bytes(title)
                 thumb_id = upload_temp_image_bytes(thumb_bytes) if thumb_bytes else None
                 inline_url = upload_inline_image_bytes(thumb_bytes) if thumb_bytes else None
                 mp_art = None
                 if thumb_id:
                     content, digest = _build_mpnews_content_sn(
-                        title_zh=sn_a.get("title_zh") or it["cn_title"],
-                        body_zh=sn_a.get("body_zh") or "",
-                        source=sn_a.get("source") or "SpaceNews",
-                        published=sn_a.get("published") or "",
+                        title_zh=title,
+                        body_zh=a.get("body_zh") or "",
+                        source=a.get("source") or "SpaceNews",
+                        published=a.get("published") or "",
                         inline_img_url=inline_url or "",
-                        original_link=sn_a.get("original_link") or "",
+                        original_link=a.get("original_link") or "",
+                        tags=tags,  # 正文开头放全部标签
                     )
                     mp_art = {
-                        "title": (sn_a.get("title_zh") or it["cn_title"])[:120],
+                        "title": titled[:120],
                         "thumb_media_id": thumb_id,
-                        "author": sn_a.get("source") or "SpaceNews",
-                        "content_source_url": sn_a.get("original_link") or it["url"],
+                        "author": a.get("source") or "SpaceNews",
+                        "content_source_url": a.get("original_link") or a.get("link"),
                         "content": content,
                         "digest": digest,
                     }
-                _add_pair(card, mp_art)
-                sn_taken += 1
+                return card, mp_art
 
-            # ---- 2) 抖音 → 回到 mpnews，正文里只放两个跳转按钮（链接由落地页自动复制）----
+            # (fallback_card, mpnews_article|None) 成对，便于按消息分块
+            items: list[tuple[dict, dict | None]] = []
+            for i, a in enumerate(selected):
+                items.append(_build_intl(a, use_hero=(i == 0)))
+
+            # ---- 抖音作为附加卡片接在国际新闻之后（标签 #航天视频）----
+            dy_reserve = min(len(douyin_items), max(0, dy_max))
             for d in douyin_items[:dy_reserve]:
-                # 抖音卡片本身不再放图（用户要求），thumb 用极简占位封面
+                dtitled = ("#航天视频 " + (d.title or f"抖音·{d.source}")).strip()
                 thumb_bytes3 = _placeholder_thumb_bytes(f"抖音·{d.source}")
                 thumb_id3 = upload_temp_image_bytes(thumb_bytes3) if thumb_bytes3 else None
-
-                # 准备落地页（带 ?copy=url / ?copy=text 自动复制视图）
                 try:
                     render_dy_landing(
-                        d.aweme_id,
-                        title=d.title,
-                        source=d.source,
-                        published=d.published,
-                        share_text=d.share_text,
-                        share_url=d.share_url or d.link,
-                        image_proxy_url="",
+                        d.aweme_id, title=d.title, source=d.source, published=d.published,
+                        share_text=d.share_text, share_url=d.share_url or d.link, image_proxy_url="",
                     )
                 except Exception as e:
                     log.warning("render dy landing failed for %s: %s", d.aweme_id, e)
-
                 dy_landing_url = f"{_public_base()}/dy/{d.aweme_id}"
-                # mpnews 失败时回退用的外链卡片
-                fallback_card3 = {
-                    "title": (d.title or f"抖音·{d.source}")[:120],
-                    "description": d.published,
-                    "url": dy_landing_url,
-                }
-                mp_art3 = None
+                fb3 = {"title": dtitled[:120], "description": d.published, "url": dy_landing_url}
+                mp3 = None
                 if thumb_id3:
                     content3, digest3 = _build_mpnews_content_dy(d, landing_base=_public_base())
-                    mp_art3 = {
-                        "title": (d.title or f"抖音·{d.source}")[:120],
-                        "thumb_media_id": thumb_id3,
-                        "author": f"抖音·{d.source}",
-                        "content_source_url": "",  # 不暴露任何外链：让用户走两个按钮
-                        "content": content3,
-                        "digest": digest3,
+                    mp3 = {
+                        "title": dtitled[:120], "thumb_media_id": thumb_id3,
+                        "author": f"抖音·{d.source}", "content_source_url": "",
+                        "content": content3, "digest": digest3,
                     }
-                _add_pair(fallback_card3, mp_art3)
+                items.append((fb3, mp3))
 
-            # ---- 3) 公众号 → 外链卡片，直跳 mp.weixin.qq.com ----
-            opml_pic_map: dict[str, tuple[str, str]] = {}
-            for e in opml:
-                img = (e.get("image_url") or "").strip()
-                if img:
-                    opml_pic_map[e.get("link", "")] = (img, e.get("link") or "")
-            for it in opml_take:
-                e_obj = opml_by_link.get(it["url"], {})
-                # 标题不再加 [公众号] 前缀，避免被卡片 UI 截断；
-                # 副标题位（description）用作来源名（如"国际太空"）便于辨识。
-                card2: dict = {
-                    "title": (it["cn_title"] or e_obj.get("title") or "")[:120],
-                    "url": it["url"],
-                    "description": e_obj.get("source") or "公众号",
+            # ---- 公众号 → 单独一条外链 news 消息（标签 #国内航天）----
+            extra_news_cards: list[dict] = []
+            opml_cap = int(os.getenv("OPML_MAX_CARDS", "6") or 6)
+            for e in opml[: max(0, opml_cap)]:
+                if not e.get("link"):
+                    continue
+                etitle = e.get("title") or ""
+                etags = tagging.tags_for(f"{etitle} {e.get('description', '')}", scope="国内航天")
+                c2: dict = {
+                    "title": (tagging.tag_prefix(etags) + etitle).strip()[:120],
+                    "url": e.get("link", ""),
+                    "description": e.get("source") or "公众号",
                 }
-                pp = opml_pic_map.get(it["url"])
-                if pp and prefetch_img(pp[0], pp[1]):
-                    card2["picurl"] = proxy_img(pp[0], pp[1])
-                extra_news_cards.append(card2)
+                img = (e.get("image_url") or "").strip()
+                if img and prefetch_img(img, e.get("link") or ""):
+                    c2["picurl"] = proxy_img(img, e.get("link") or "")
+                extra_news_cards.append(c2)
 
-            news_ok = False
-            used_mpnews = False
+            # ---------- 真实内容判定：订阅引导卡不算内容 ----------
+            # items=国际(mpnews)+抖音；extra_news_cards=公众号。两者全空即"今日无文章"。
+            has_real_content = bool(items) or bool(extra_news_cards)
 
-            # ---- A) SpaceNews + 抖音 → mpnews 原生渲染 ----
-            if mpnews_articles and len(mpnews_articles) == len(mpnews_cards_fallback):
-                try:
-                    mp_res = send_mpnews(mpnews_articles)
-                    if mp_res and mp_res.get("errcode") == 0:
-                        results.append(mp_res)
-                        news_ok = True
-                        used_mpnews = True
+            # ---------- 无任何真实文章：整条都不发（连总览/订阅卡都不发）----------
+            if not has_real_content:
+                log.info("no real articles this session; skip push entirely (promo not sent alone)")
+                record["sent"] = False
+                record["skipped"] = "no-new-content"
+                record["msg_chunks"] = 0
+            else:
+                # ---------- 订阅引导：上午(morning)不发；下午(evening)及手动固定发 ----------
+                promo_card: dict | None = None
+                promo_article: dict | None = None
+                if session_key != "morning":
+                    promo_card, promo_article = _promo_mpnews_article()
+
+                chunks = _chunk_balanced(items, CARD_LIMIT)
+                if promo_card is not None and not extra_news_cards:
+                    if chunks:
+                        if len(chunks[-1]) >= CARD_LIMIT:
+                            chunks[-1] = chunks[-1][:CARD_LIMIT - 1]
+                        chunks[-1].append((promo_card, promo_article))
                     else:
-                        log.warning("send_mpnews non-zero, fallback to news: %s", mp_res)
-                except Exception as e:
-                    log.exception("send_mpnews raised, fallback to news: %s", e)
+                        chunks = [[(promo_card, promo_article)]]
+                    promo_card = None  # 已消费
 
-            if not used_mpnews and mpnews_cards_fallback:
-                try:
-                    news_res = send_news(mpnews_cards_fallback)
-                    if news_res and news_res.get("errcode") == 0:
-                        results.append(news_res)
-                        news_ok = True
-                    else:
-                        log.warning("send_news non-zero: %s", news_res)
-                except Exception as e:
-                    log.exception("send_news raised: %s", e)
+                record["msg_chunks"] = len(chunks)
+                record["promo_placed"] = "skipped-morning" if session_key == "morning" else "appended-last"
 
-            # ---- B) 公众号 + 抖音 → 一条外链 news 消息 ----
-            if extra_news_cards:
-                try:
-                    ex_res = send_news(extra_news_cards)
-                    if ex_res and ex_res.get("errcode") == 0:
-                        results.append(ex_res)
-                    else:
-                        log.warning("send_news(extra) non-zero: %s", ex_res)
-                except Exception as e:
-                    log.exception("send_news(extra) raised: %s", e)
 
-            # ---------- Fallback: news 失败时再补图+列表（text 总览已发） ----------
-            if not news_ok:
-                log.info("news send failed, fallback to image+text-list flow")
-                if hero_candidates:
-                    img_res = send_image(candidates=hero_candidates)
-                    if img_res is not None:
-                        results.append(img_res)
-                    else:
-                        log.info("hero image send skipped (all %d candidates failed)", len(hero_candidates))
-                if tail:
-                    results.extend(send_text(tail))
+                head, tail = _split_overview_and_list(summary)
+                if head:
+                    results.extend(send_text(head))
+                    # 文字与首条图文之间也留间隔，保证「先文字后图文」顺序
+                    if chunks or extra_news_cards:
+                        time.sleep(2)
 
-            ok = all(r.get("errcode") == 0 for r in results) if results else False
-            record["sent"] = ok
-            record["send_response"] = results
-            record["hero_image_url"] = hero_image_url
-            record["used_news_msgtype"] = news_ok
-            record["used_mpnews"] = used_mpnews
-            if not ok:
-                log.error("WeCom send returned non-zero errcode: %s", results)
+                news_ok = False
+                used_mpnews = False
+                for ci, chunk in enumerate(chunks):
+                    if ci > 0:
+                        time.sleep(2)
+                    arts = [mp for (_c, mp) in chunk]
+                    fbs = [c for (c, _mp) in chunk]
+                    sent = False
+                    if arts and all(x is not None for x in arts):
+                        try:
+                            mp_res = send_mpnews(arts)
+                            if mp_res and mp_res.get("errcode") == 0:
+                                results.append(mp_res)
+                                news_ok = True
+                                used_mpnews = True
+                                sent = True
+                            else:
+                                log.warning("send_mpnews non-zero, fallback news: %s", mp_res)
+                        except Exception as e:
+                            log.exception("send_mpnews raised: %s", e)
+                    if not sent and fbs:
+                        try:
+                            n_res = send_news(fbs)
+                            if n_res and n_res.get("errcode") == 0:
+                                results.append(n_res)
+                                news_ok = True
+                            else:
+                                log.warning("send_news non-zero: %s", n_res)
+                        except Exception as e:
+                            log.exception("send_news raised: %s", e)
+
+                if extra_news_cards or promo_card is not None:
+                    if promo_card is not None:
+                        del extra_news_cards[CARD_LIMIT - 1:]
+                        extra_news_cards.append(promo_card)
+                    try:
+                        time.sleep(2)
+                        ex_res = send_news(extra_news_cards)
+                        if ex_res and ex_res.get("errcode") == 0:
+                            results.append(ex_res)
+                        else:
+                            log.warning("send_news(extra) non-zero: %s", ex_res)
+                    except Exception as e:
+                        log.exception("send_news(extra) raised: %s", e)
+
+                if not news_ok:
+                    log.info("intl send failed, fallback to image+text-list flow")
+                    if hero_candidates:
+                        img_res = send_image(candidates=hero_candidates)
+                        if img_res is not None:
+                            results.append(img_res)
+                    if tail:
+                        results.extend(send_text(tail))
+
+                ok = all(r.get("errcode") == 0 for r in results) if results else False
+                record["sent"] = ok
+                record["send_response"] = results
+                record["hero_image_url"] = hero_image_url
+                record["used_news_msgtype"] = news_ok
+                record["used_mpnews"] = used_mpnews
+                if ok:
+                    pushed = list(sn) + list(opml) + [
+                        {"link": d.link, "title": d.title} for d in douyin_items[:dy_reserve]
+                    ]
+                    try:
+                        dedup.record(pushed)
+                    except Exception as e:
+                        log.warning("dedup.record failed: %s", e)
+                else:
+                    log.error("WeCom send returned non-zero errcode: %s", results)
         except Exception as e:
             log.exception("send pipeline failed: %s", e)
             record["send_error"] = str(e)
 
-        # ---------- 同步一份聚合图文到公众号（不会群发到关注者） ----------
-        try:
-            hero_ref = (hero_article or {}).get("original_link") if hero_article else ""
-            mp_url = _try_publish_to_mp(
-                title=f"航天{session_label}速递 {date_str}",
-                summary_md=summary_md,
-                hero_image_url=hero_image_url,
-                hero_referer=hero_ref or "",
-                douyin_dicts=douyin_dicts,
-            )
-            if mp_url:
-                record["wx_mp_url"] = mp_url
-                try:
-                    send_text(f"📰 同步公众号永久链接：\n<a href=\"{mp_url}\">{mp_url}</a>")
-                except Exception as e:
-                    log.warning("send mp url message failed: %s", e)
-        except Exception as e:
-            log.exception("wx_mp pipeline failed: %s", e)
+        # ---------- 同步一份聚合图文到公众号（无新内容时不同步） ----------
+        if record.get("skipped") == "no-new-content":
+            log.info("skip wx_mp sync (no new content)")
+        else:
+            try:
+                hero_ref = (hero_article or {}).get("original_link") if hero_article else ""
+                mp_url = _try_publish_to_mp(
+                    title=f"航天{session_label}速递 {date_str}",
+                    summary_md=summary_md,
+                    hero_image_url=hero_image_url,
+                    hero_referer=hero_ref or "",
+                    douyin_dicts=douyin_dicts,
+                )
+                if mp_url:
+                    record["wx_mp_url"] = mp_url
+                    try:
+                        send_text(f"📰 同步公众号永久链接：\n<a href=\"{mp_url}\">{mp_url}</a>")
+                    except Exception as e:
+                        log.warning("send mp url message failed: %s", e)
+            except Exception as e:
+                log.exception("wx_mp pipeline failed: %s", e)
 
     p = cache_path(date_str, session_key)
     p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")

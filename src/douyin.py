@@ -84,17 +84,34 @@ def fetch_user_recent(
     hours: int = 24,
     count: int = 20,
     api_base: str | None = None,
-    timeout: float = 15.0,
+    timeout: float | None = None,
+    retries: int | None = None,
 ) -> list[DouyinEntry]:
     base = (api_base or os.getenv("DOUYIN_API_BASE", DEFAULT_API_BASE)).rstrip("/")
     url = f"{base}/api/douyin/web/fetch_user_post_videos"
     params = {"sec_user_id": sec_user_id, "max_cursor": 0, "count": count}
-    try:
-        r = requests.get(url, params=params, timeout=timeout)
-        r.raise_for_status()
-        payload = r.json()
-    except Exception as e:
-        log.warning("douyin fetch failed for %s (%s): %s", name or sec_user_id, sec_user_id, e)
+    # 本机抖音 API 首次/冷启动可达 ~20s，给足超时并重试，避免偶发超时被当成"没作品"
+    if timeout is None:
+        timeout = float(os.getenv("DOUYIN_TIMEOUT", "45") or 45)
+    if retries is None:
+        retries = int(os.getenv("DOUYIN_RETRIES", "2") or 2)
+
+    payload = None
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            payload = r.json()
+            break
+        except Exception as e:
+            last_err = e
+            log.warning(
+                "douyin fetch attempt %d/%d failed for %s (%s): %s",
+                attempt, retries, name or sec_user_id, sec_user_id, e,
+            )
+    if payload is None:
+        log.warning("douyin fetch gave up for %s (%s): %s", name or sec_user_id, sec_user_id, last_err)
         return []
 
     data = (payload or {}).get("data") or {}
@@ -136,6 +153,49 @@ def fetch_user_recent(
     entries.sort(key=lambda e: e.create_ts, reverse=True)
     log.info("douyin %s -> %d entries within %dh", name or sec_user_id, len(entries), hours)
     return entries
+
+
+def selfcheck(
+    users_raw: str | None = None,
+    *,
+    api_base: str | None = None,
+    timeout: float | None = None,
+) -> tuple[bool, str]:
+    """轻量自检：探活抖音 API + 判断 Cookie 是否可能失效。
+
+    返回 (ok, detail)：
+      ok=True  ：接口正常且至少一个账号能取到作品列表
+      ok=False ：接口不可达/超时，或接口通但所有账号都取不到作品（Cookie 多半失效）
+    只读一次接口，尽量便宜。
+    """
+    base = (api_base or os.getenv("DOUYIN_API_BASE", DEFAULT_API_BASE)).rstrip("/")
+    url = f"{base}/api/douyin/web/fetch_user_post_videos"
+    if timeout is None:
+        timeout = float(os.getenv("DOUYIN_TIMEOUT", "45") or 45)
+    users = _parse_users(users_raw or os.getenv("DOUYIN_USERS", ""))
+    if not users:
+        return True, "未配置 DOUYIN_USERS，跳过自检"
+
+    name, sec = users[0]
+    try:
+        r = requests.get(url, params={"sec_user_id": sec, "max_cursor": 0, "count": 5}, timeout=timeout)
+    except Exception as e:
+        return False, f"接口不可达/超时：{e.__class__.__name__}: {e}"
+    if r.status_code != 200:
+        return False, f"接口 HTTP 异常：{r.status_code}"
+    try:
+        payload = r.json()
+    except Exception as e:
+        return False, f"接口返回非 JSON：{e}"
+
+    data = (payload or {}).get("data") or {}
+    status_code = data.get("status_code")
+    aweme_list = data.get("aweme_list") or []
+    if status_code not in (0, None):
+        return False, f"接口业务码异常 status_code={status_code}（Cookie 可能已失效）"
+    if not aweme_list:
+        return False, f"账号「{name}」返回空作品列表（Cookie 可能已失效或账号无作品）"
+    return True, f"正常：账号「{name}」返回 {len(aweme_list)} 条作品"
 
 
 def fetch_douyin_recent(

@@ -14,17 +14,99 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
+import requests
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
+
+ZLZCHAT_BASE = "http://8.130.209.181:10082"
+ZLZCHAT_KEY = "lq3525926"
+# 需刷新的公众号 wxsId（与 OPML 里两个订阅源对应，格式须带 MP_WXS_ 前缀）
+ZLZCHAT_WXS_IDS = ["MP_WXS_3931671274", "MP_WXS_3094327014"]
+
+
+def update_zlzchat_feeds():
+    """早间推送前调用 zlzchat /updateFeed 接口，逐个 wxsId 刷新公众号 RSS。"""
+    for wxs_id in ZLZCHAT_WXS_IDS:
+        url = f"{ZLZCHAT_BASE}/updateFeed?key={ZLZCHAT_KEY}&wxsId={wxs_id}"
+        try:
+            r = requests.get(url, timeout=60)
+            logging.info("zlzchat updateFeed wxsId=%s -> %s %s", wxs_id, r.status_code, r.text[:200])
+        except Exception as e:
+            logging.exception("zlzchat updateFeed wxsId=%s failed: %s", wxs_id, e)
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import os  # noqa: E402
+
 from src.config import SETTINGS  # noqa: E402
 from src.daily import run_daily  # noqa: E402
+from src.join_qr import fetch_join_qrcode  # noqa: E402
+from src.cleanup import run as run_cleanup  # noqa: E402
+from src.wecom import send_text  # noqa: E402
+
+# 每 6 天提醒谁更换二维码、提示要覆盖的文件
+QR_REMIND_USER = "LuoYiHe"
+QR_PATH_HINT = "data/join/plugin_qr.png"
+
+
+def remind_replace_qrcode():
+    """每 6 天给 LuoYiHe 个人推一条"更换微信插件二维码"的提醒。"""
+    base = (os.getenv("PUBLIC_BASE_URL", "") or "").rstrip("/")
+    msg = (
+        "🔔 微信插件二维码更换提醒（每 6 天）\n\n"
+        "请到「企业微信管理后台 → 我的企业 → 微信插件」下载最新二维码，\n"
+        f"覆盖服务器文件：{QR_PATH_HINT}（覆盖后自动生效，无需重启）。"
+    )
+    if base:
+        msg += f"\n\n当前展示页：{base}/join"
+    try:
+        send_text(msg, to_user=QR_REMIND_USER)
+        logging.info("qr replace reminder sent to %s", QR_REMIND_USER)
+    except Exception as e:
+        logging.exception("qr replace reminder failed: %s", e)
+
+
+def daily_cleanup():
+    try:
+        run_cleanup(days=15)
+    except Exception as e:
+        logging.exception("cleanup failed: %s", e)
+
+
+def douyin_selfcheck():
+    """每日推送前轻量自检抖音接口；仅在异常时给 LuoYiHe 推一条提醒。"""
+    try:
+        from src.douyin import selfcheck
+        ok, detail = selfcheck()
+    except Exception as e:
+        ok, detail = False, f"自检执行异常：{e}"
+    logging.info("douyin selfcheck ok=%s detail=%s", ok, detail)
+    if not ok:
+        msg = (
+            "⚠️ 抖音自检异常\n\n"
+            f"{detail}\n\n"
+            "可能原因：抖音 API 容器 Cookie 失效 / 容器异常。\n"
+            "处理：检查 douyin_api 容器并更新其登录 Cookie（sec_user_id 无需改动）。"
+        )
+        try:
+            send_text(msg, to_user="LuoYiHe")
+        except Exception as e:
+            logging.exception("douyin selfcheck alert failed: %s", e)
+
+
+def refresh_join_qrcode():
+    """每日刷新两种码：企业码（get_join_qrcode，7天有效）+ 微信插件码（静态）。"""
+    try:
+        fetch_join_qrcode()
+        logging.info("join QRs (enterprise + plugin) synced")
+    except Exception as e:
+        logging.warning("join QR sync skipped: %s", e)
 
 
 def _session_hours(key: str) -> int:
@@ -75,6 +157,24 @@ def main():
             id="morning_brief", misfire_grace_time=600,
         )
         enabled.append(f"早间 {SETTINGS.morning_hour:02d}:{SETTINGS.morning_minute:02d}")
+        # 早间推送前 22 分钟，刷新 zlzchat 公众号订阅
+        pre = (datetime(2000, 1, 1, SETTINGS.morning_hour, SETTINGS.morning_minute)
+               - timedelta(minutes=22))
+        sched.add_job(
+            update_zlzchat_feeds,
+            trigger=CronTrigger(hour=pre.hour, minute=pre.minute, timezone=SETTINGS.daily_tz),
+            id="zlzchat_feed_refresh", misfire_grace_time=300,
+        )
+        enabled.append(f"公众号刷新 {pre.hour:02d}:{pre.minute:02d}")
+        # 早间推送前 25 分钟，轻量自检抖音接口（仅异常时提醒 LuoYiHe）
+        pre_dy = (datetime(2000, 1, 1, SETTINGS.morning_hour, SETTINGS.morning_minute)
+                  - timedelta(minutes=25))
+        sched.add_job(
+            douyin_selfcheck,
+            trigger=CronTrigger(hour=pre_dy.hour, minute=pre_dy.minute, timezone=SETTINGS.daily_tz),
+            id="douyin_selfcheck", misfire_grace_time=300,
+        )
+        enabled.append(f"抖音自检 {pre_dy.hour:02d}:{pre_dy.minute:02d}")
     if SETTINGS.evening_hour is not None:
         sched.add_job(
             make_job("晚间", "evening"),
@@ -82,6 +182,31 @@ def main():
             id="evening_brief", misfire_grace_time=600,
         )
         enabled.append(f"晚间 {SETTINGS.evening_hour:02d}:{SETTINGS.evening_minute:02d}")
+
+    # 每天 03:30 把「微信插件」二维码按 .env 配置同步一次（静态来源，便宜）
+    sched.add_job(
+        refresh_join_qrcode,
+        trigger=CronTrigger(hour=3, minute=30, timezone=SETTINGS.daily_tz),
+        id="join_qrcode_refresh", misfire_grace_time=3600,
+    )
+    enabled.append("微信插件二维码 每日03:30")
+
+    # 每 6 天 09:30 提醒 LuoYiHe 更换微信插件二维码（真正的 6 天间隔，不受月份边界影响）
+    _qr_start = datetime.now().replace(hour=9, minute=30, second=0, microsecond=0)
+    sched.add_job(
+        remind_replace_qrcode,
+        trigger=IntervalTrigger(days=6, start_date=_qr_start, timezone=SETTINGS.daily_tz),
+        id="qr_replace_remind", misfire_grace_time=3600,
+    )
+    enabled.append("二维码更换提醒 每6天09:30→LuoYiHe")
+
+    # 每天 03:45 清理：ingest / cache / translate_cache / img_cache / dy_pages / news_pages，仅保留 15 天
+    sched.add_job(
+        daily_cleanup,
+        trigger=CronTrigger(hour=3, minute=45, timezone=SETTINGS.daily_tz),
+        id="daily_cleanup", misfire_grace_time=3600,
+    )
+    enabled.append("缓存清理 每日03:45")
 
     if not enabled:
         logging.error("Both DAILY_MORNING_HOUR and DAILY_EVENING_HOUR are empty; nothing to schedule.")

@@ -51,6 +51,8 @@ h3{{font-size:18px;margin:0 0 6px;font-weight:600;line-height:1.4}}
 .dlg .msg{{font-size:14px;color:#444;line-height:1.6;margin:0 0 14px;text-align:left}}
 .dlg .ok{{display:inline-block;padding:8px 28px;border-radius:18px;border:0;background:#111;color:#fff;font-size:13px;cursor:pointer}}
 .dlg .ok:active{{opacity:.85}}
+.promo{{margin:26px 0 0;padding-top:14px;border-top:1px dashed #e0e0e0;font-size:12px;color:#666;text-align:center;line-height:1.7}}
+.promo a{{color:#1166ee;text-decoration:none;font-weight:500}}
 </style>
 </head><body>
 <h3>{title}</h3>
@@ -67,6 +69,10 @@ h3{{font-size:18px;margin:0 0 6px;font-weight:600;line-height:1.4}}
 <div class="section">
   <div class="label">📨 抖音口令（点击上方按钮一键复制；或长按下方文本手动选中复制）</div>
   <div class="value" id="vShare">{share_text}</div>
+</div>
+
+<div class="promo">
+  👉 <a href="{promo_url}">点此扫码邀请同好关注航天速递</a>
 </div>
 
 <div class="mask" id="mask">
@@ -153,6 +159,8 @@ def render_landing(
     )
     safe_share_text = share_text or "（该条作品无口令文本，请直接在抖音 App 内搜索作者）"
     data_blob = json.dumps({"url": share_url or "", "text": safe_share_text}, ensure_ascii=False)
+    import os as _os
+    promo_url = (_os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or "") + "/join"
     page = _PAGE_TPL.format(
         title=html.escape(title or "抖音作品"),
         source=html.escape(source or ""),
@@ -161,6 +169,7 @@ def render_landing(
         share_text=html.escape(safe_share_text),
         share_url_text=html.escape(share_url or ""),
         data_json=data_blob,
+        promo_url=html.escape(promo_url),
     )
     out = DY_PAGES_DIR / f"{aweme_id}.html"
     out.write_text(page, encoding="utf-8")

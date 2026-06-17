@@ -18,7 +18,7 @@ import logging
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -26,10 +26,55 @@ import requests
 from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
+
 from .config import SETTINGS
 from .summarizer import client as openai_client
+from . import tagging
 
 log = logging.getLogger(__name__)
+
+CST = timezone(timedelta(hours=8))
+_CN_DT_RE = re.compile(r"(\d{4})\D+(\d{1,2})\D+(\d{1,2})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?")
+
+
+def _parse_dt(s: str) -> datetime | None:
+    """尽量把各种时间字符串解析为带时区的 datetime。"""
+    if not s:
+        return None
+    s = s.strip()
+    # 1) ISO 8601（含 +00:00 / Z）
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    # 2) RFC822（Thu, 11 Jun 2026 21:14:44 +0000）
+    try:
+        d = parsedate_to_datetime(s)
+        if d is not None:
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    # 3) 中文 2026年06月11日 09:30:02（spacelive，本身即北京时间）
+    m = _CN_DT_RE.search(s)
+    if m:
+        y, mo, d_, h, mi, se = (int(x) if x else 0 for x in m.groups())
+        try:
+            return datetime(y, mo, d_, h, mi, se, tzinfo=CST)
+        except Exception:
+            return None
+    return None
+
+
+def to_beijing(s: str, *, with_label: bool = True) -> str:
+    """把时间字符串转为北京时间显示；无法解析则原样返回。"""
+    d = _parse_dt(s)
+    if not d:
+        return s or ""
+    out = d.astimezone(CST).strftime("%Y-%m-%d %H:%M")
+    return f"{out}（北京时间）" if with_label else out
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 HEADERS = {
@@ -120,8 +165,9 @@ _TRANSLATE_SYS = (
     "**硬性要求**：\n"
     "1. 每一段原文都必须翻译，不得跳过、合并、概括或省略；译文段落数与原文段落数必须一致。\n"
     "2. 严格保留段落分隔（即译文段落之间也用空行隔开）。\n"
-    "3. 多篇新闻之间用特殊分隔符 `" + ARTICLE_DELIM + "` 分开，译文中必须用同样的分隔符把每篇隔开，"
-    "且数量与输入完全一致（输入有 N 处分隔符 → 输出也必须有 N 处）。\n"
+    "3. 每篇英文前都有一个形如 `###@@@SEG<数字>@@@###` 的分隔标记。"
+    "请在输出中，**每篇译文前都原样保留它自己的那个标记**（数字与先后顺序都不能变，"
+    "不得新增、删除、改写、翻译或合并这些标记）；标记之外不要再输出其它标记。\n"
     "4. 除翻译正文外，不要输出任何额外说明、总结、声明、Markdown 元信息或英文备注。\n"
     "5. 遇到段落是"
     "『 By submitting this form, you agree to ... 』『 Sign up for our newsletter 』『 Subscribe / Sign In 』"
@@ -140,16 +186,19 @@ _TRANSLATE_SYS = (
 )
 
 
-def _batch_translate(en_blocks: list[str]) -> list[str]:
-    """一次 API 调用翻译多篇，按分隔符切回。
+# 带编号的分段标记：即使模型漏掉/合并个别标记，也能按编号把对得上的篇目回收，
+# 只对「真正缺失/明显截断」的篇目单篇重译，避免整批回退逐篇（既慢又贵）。
+_SEG_RE = re.compile(r"#{2,}@@@SEG(\d+)@@@#{2,}")
+_BATCH_CHUNK = 6  # 每次 GPT 调用最多翻译多少篇（篇数越少，标记越不易错乱）
 
-    为防止 GPT 提前 "Done."，使用 max_tokens 上调 + 检测明显截断后逐篇重试。
-    """
-    if not en_blocks:
-        return []
-    joined = ("\n\n" + ARTICLE_DELIM + "\n\n").join(en_blocks)
-    # gpt-4.1-mini 输出上限 ~16K tokens；按英文 1 token ≈ 0.75 词，中文 1 字 ≈ 1 token，
-    # 一篇 SpaceNews 5K 字符英文 → 译文最多 ~3K 中文字符；多篇合并仍预留充足空间。
+
+def _seg_marker(n: int) -> str:
+    return f"###@@@SEG{n}@@@###"
+
+
+def _translate_group(group: list[str], base: int) -> list[str]:
+    """翻译一小批（≤_BATCH_CHUNK 篇），用带编号标记切回，缺失篇目单篇兜底。"""
+    joined = "\n\n".join(f"{_seg_marker(base + k + 1)}\n{b}" for k, b in enumerate(group))
     try:
         resp = openai_client().chat.completions.create(
             model=SETTINGS.openai_model,
@@ -160,26 +209,39 @@ def _batch_translate(en_blocks: list[str]) -> list[str]:
             temperature=0.2,
             max_tokens=8192,
         )
-        text = resp.choices[0].message.content
+        text = resp.choices[0].message.content or ""
     except Exception as e:
-        log.exception("batch translate failed: %s", e)
-        return en_blocks  # 翻译失败就降级回原文
+        log.exception("group translate failed: %s", e)
+        return [_translate_single(b) for b in group]
 
-    out = [p.strip() for p in text.split(ARTICLE_DELIM)]
-    if len(out) != len(en_blocks):
-        log.warning("translate split mismatch %d vs %d, fallback to per-article", len(out), len(en_blocks))
-        out = [_translate_single(b) for b in en_blocks]
-        return out
+    # 按编号回收：marker n → 其后到下一 marker 之间的文本
+    found: dict[int, str] = {}
+    matches = list(_SEG_RE.finditer(text))
+    for i, m in enumerate(matches):
+        s = m.end()
+        e = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        found[int(m.group(1))] = text[s:e].strip()
 
-    # 检测「译文长度异常短」的篇目，逐篇重试
-    fixed: list[str] = []
-    for en, zh in zip(en_blocks, out):
-        if len(zh) < max(120, len(en) * 0.25):
-            log.warning("translation looks truncated (%d vs %d), retry per-article", len(zh), len(en))
-            fixed.append(_translate_single(en))
-        else:
-            fixed.append(zh)
-    return fixed
+    result: list[str] = []
+    for k, en in enumerate(group):
+        zh = found.get(base + k + 1, "")
+        if not zh or len(zh) < max(120, len(en) * 0.25):
+            log.warning("seg %d missing/short, retry per-article", base + k + 1)
+            zh = _translate_single(en)
+        result.append(zh)
+    return result
+
+
+def _batch_translate(en_blocks: list[str]) -> list[str]:
+    """分小批翻译多篇；每批用带编号标记切回，缺失篇目单篇兜底。"""
+    if not en_blocks:
+        return []
+    out: list[str] = []
+    for start in range(0, len(en_blocks), _BATCH_CHUNK):
+        group = en_blocks[start:start + _BATCH_CHUNK]
+        log.info("translate group [%d..%d) (%d articles)", start, start + len(group), len(group))
+        out.extend(_translate_group(group, base=start))
+    return out
 
 
 def _translate_single(en: str) -> str:
@@ -214,8 +276,11 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsof
 h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 .meta {{ color: #8a8f99; font-size: 13px; margin-bottom: 18px; }}
 .meta a {{ color: #1664ff; text-decoration: none; }}
+.tags {{ margin: 0 0 14px; }}
+.tags span {{ display: inline-block; background: #eef2ff; color: #1664ff; font-size: 13px;
+              padding: 2px 10px; border-radius: 12px; margin: 0 6px 6px 0; }}
 .hero {{ width: 100%; border-radius: 8px; margin: 12px 0 20px; }}
-.body p {{ margin: 0 0 16px; font-size: 16px; }}
+.body p {{ margin: 0 0 18px; font-size: 16px; text-indent: 2em; line-height: 1.9; }}
 .body img {{ max-width: 100%; height: auto; border-radius: 6px; margin: 14px 0; }}
 .footer {{ margin-top: 32px; padding-top: 16px; border-top: 1px solid #eee;
            font-size: 13px; color: #8a8f99; }}
@@ -225,6 +290,7 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 <body>
 <h1>{title_zh}</h1>
 <div class="meta">来源：{source} · {published}</div>
+{tags_html}
 {hero_html}
 <div class="body">
 {body_html}
@@ -335,6 +401,7 @@ class PageResult:
     image_url: str  # 选定的主图（绝对 URL）
     title_zh: str = ""   # 中文标题（若翻译失败 = 原文标题）
     body_zh: str = ""    # 中文正文（纯文本，按段落用 \n\n 分隔；翻译失败为空）
+    tags: list = field(default_factory=list)  # 主题标签 + 范围标签
 
 
 def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | None = None) -> dict[str, PageResult]:
@@ -399,7 +466,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             en_index.append(i)
 
     if en_blocks:
-        log.info("translate %d articles in one GPT call", len(en_blocks))
+        log.info("translate %d articles (chunked, %d/group)", len(en_blocks), _BATCH_CHUNK)
         zh_blocks = _batch_translate(en_blocks)
         for i, zh in zip(en_index, zh_blocks):
             fetched[i]["_zh"] = zh
@@ -455,14 +522,23 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
                 + tip + "</div>"
             )
 
+        # 主题标签（基于中文标题+正文）；范围标签固定为国际新闻（三源均为境外英文源）
+        tags = tagging.tags_for(f"{title_zh} {zh_text}", scope="国际新闻")
+        tags_html = (
+            '<div class="tags">' + "".join(f"<span>#{html.escape(t)}</span>" for t in tags) + "</div>"
+            if tags else ""
+        )
+        title_display = (tagging.tag_prefix(tags) + title_zh).strip()
+
         hero = item.get("image_url") or item.get("_og") or (item["_imgs"][0] if item["_imgs"] else "")
         hero_display = _proxy_image(hero)
         hero_html = f'<img class="hero" src="{html.escape(hero_display)}" alt="">' if hero else ""
 
         page_html = _PAGE_TPL.format(
-            title_zh=html.escape(title_zh),
+            title_zh=html.escape(title_display),
             source=html.escape(item.get("source", "")),
-            published=html.escape(item.get("published", "")),
+            published=html.escape(to_beijing(item.get("published", ""))),
+            tags_html=tags_html,
             hero_html=hero_html,
             body_html=body_html,
             orig_url=html.escape(item.get("link", "")),
@@ -477,12 +553,81 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             image_url=hero,
             title_zh=title_zh,
             body_zh=zh_text,
+            tags=tags,
         )
 
     # ----- 4. 轮转 -----
     _rotate(batch_id, ids_in_batch)
     log.info("batch %s wrote %d pages", batch_id, len(ids_in_batch))
     return out
+
+
+def _render_page_html(*, title_zh: str, source: str, published: str,
+                      orig_url: str, body_zh: str, image_url: str) -> str:
+    """仅用已有字段渲染一张翻译页 HTML（不抓取、不翻译）。"""
+    if (body_zh or "").strip():
+        body_html = _para_to_html(body_zh)
+    else:
+        body_html = (
+            '<div style="background:#fff7e6;border:1px solid #ffd591;'
+            'border-radius:6px;padding:14px 16px;color:#8c4a00;'
+            'font-size:15px;line-height:1.7;">'
+            "<b>原文暂无法展示</b><br>请点击下方“原文链接”查看英文原版。</div>"
+        )
+    tags = tagging.tags_for(f"{title_zh} {body_zh}", scope="国际新闻")
+    tags_html = (
+        '<div class="tags">' + "".join(f"<span>#{html.escape(t)}</span>" for t in tags) + "</div>"
+        if tags else ""
+    )
+    title_display = (tagging.tag_prefix(tags) + (title_zh or "")).strip()
+    hero_display = _proxy_image(image_url or "")
+    hero_html = f'<img class="hero" src="{html.escape(hero_display)}" alt="">' if image_url else ""
+    return _PAGE_TPL.format(
+        title_zh=html.escape(title_display),
+        source=html.escape(source or ""),
+        published=html.escape(to_beijing(published or "")),
+        tags_html=tags_html,
+        hero_html=hero_html,
+        body_html=body_html,
+        orig_url=html.escape(orig_url or ""),
+    )
+
+
+def rebuild_pages_from_cache(articles: list[dict]) -> int:
+    """重发场景：根据缓存里已存的 body_zh/title_zh/image_url 直接把翻译页写回磁盘，
+    不重新抓取/翻译。页面路径从每条的 link(/news/{batch}/{page_id}) 解析。
+
+    返回成功重建的页面数。
+    """
+    n = 0
+    for a in articles or []:
+        link = a.get("link") or ""
+        if "/news/" not in link:
+            continue
+        try:
+            tail = link.split("/news/", 1)[1].strip("/")
+            batch_id, page_id = tail.split("/", 1)
+        except Exception:
+            continue
+        if not batch_id or not page_id:
+            continue
+        try:
+            page_html = _render_page_html(
+                title_zh=a.get("title_zh") or a.get("title") or "",
+                source=a.get("source") or "",
+                published=a.get("published") or "",
+                orig_url=a.get("original_link") or "",
+                body_zh=a.get("body_zh") or "",
+                image_url=a.get("image_url") or "",
+            )
+            d = PAGES_ROOT / batch_id
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{page_id}.html").write_text(page_html, encoding="utf-8")
+            n += 1
+        except Exception as e:
+            log.warning("rebuild page failed for %s: %s", link, e)
+    log.info("rebuild_pages_from_cache wrote %d pages", n)
+    return n
 
 
 def page_file(batch_id: str, page_id: str) -> Path:

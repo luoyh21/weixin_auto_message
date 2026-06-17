@@ -23,22 +23,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--cache", required=True, help="缓存文件名（不含扩展名），例如 evening_2026-05-27")
-    p.add_argument("--to", default=None, help="覆盖收件人 UserId（管道分隔）")
-    p.add_argument("--luoyihe", action="store_true", help="仅发给 LuoYiHe（测试用）")
-    args = p.parse_args()
+def resend(cache_name: str, to_user: str | None = None) -> tuple[bool, list]:
+    """从缓存重发一条半天速递给指定收件人（不重跑抓取/总结）。
 
-    if args.to:
-        os.environ["WECOM_TO_USER"] = args.to
-    elif args.luoyihe:
-        os.environ["WECOM_TO_USER"] = "LuoYiHe"
-
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
-
-    # 必须在 env 覆盖后再 import，否则 SETTINGS 已固化旧值
+    cache_name: 不含扩展名，例如 evening_2026-06-12
+    to_user:    收件人 UserId（管道分隔）；None 则用 .env 默认（一般 @all）
+    返回 (ok, results)
+    """
     from src.config import SETTINGS
     from src.wecom import send_text, send_news
     from src.img_proxy import proxify as proxy_img, prefetch as prefetch_img
@@ -50,15 +41,22 @@ def main():
         _pick_hero,
     )
 
-    cache_path = SETTINGS.cache_dir / f"{args.cache}.json"
+    cache_path = SETTINGS.cache_dir / f"{cache_name}.json"
     if not cache_path.exists():
         logging.error("cache file not found: %s", cache_path)
-        return 2
+        return False, []
     rec = json.loads(cache_path.read_text("utf-8"))
 
     summary = rec.get("summary", "")
     sn = rec.get("spacenews", []) or []
     douyin = rec.get("douyin", []) or []
+
+    # 翻译页可能已被轮转删除 → 用缓存里的 body_zh 直接重建到磁盘，避免点开 404
+    try:
+        from src.news_pages import rebuild_pages_from_cache
+        rebuild_pages_from_cache(sn)
+    except Exception as e:
+        logging.warning("rebuild news pages skipped: %s", e)
 
     head, tail = _split_overview_and_list(summary)
 
@@ -136,20 +134,82 @@ def main():
 
     logging.info(
         "recipient=%s; head=%dB; news_cards=%d (sn=%d dy=%d); hero=%s",
-        os.environ.get("WECOM_TO_USER", "(env default)"),
+        to_user or "(env default)",
         len(head.encode("utf-8")), len(news_cards),
         sum(1 for c in news_cards if not c["title"].startswith("[抖音")),
         sum(1 for c in news_cards if c["title"].startswith("[抖音")),
         hero_image_url[:80],
     )
 
+    import time
     results = []
     if head:
-        results.extend(send_text(head))
+        results.extend(send_text(head, to_user=to_user))
+    # 订阅引导作为最后一栏并入图文消息，不在文字里放扫码链接、也不单独发送
+    from src.daily import _promo_news_card
+    news_cards.append(_promo_news_card())
     if news_cards:
-        results.append(send_news(news_cards))
+        # 文字与图文之间留间隔，确保接收端按「先文字后图文」顺序展示
+        if head:
+            time.sleep(2)
+        results.append(send_news(news_cards, to_user=to_user))
 
     ok = all(r and r.get("errcode") == 0 for r in results)
+    return ok, results
+
+
+def _cache_has_content(path: Path) -> bool:
+    """缓存是否含真实文章（spacenews/opml/douyin 任一非空，且未被标记为无内容）。"""
+    try:
+        rec = json.loads(path.read_text("utf-8"))
+    except Exception:
+        return False
+    if rec.get("skipped") == "no-new-content":
+        return False
+    return bool(rec.get("spacenews") or rec.get("opml") or rec.get("douyin"))
+
+
+def latest_cache_name(require_content: bool = True) -> str | None:
+    """返回最近一份半天缓存名（morning_/evening_）。
+
+    require_content=True（默认）：跳过"今日无文章"的空缓存，返回最近一份**有内容**的，
+    用于新成员补发"默认有效的第一条"。
+    """
+    from src.config import SETTINGS
+    import glob
+    files = sorted(
+        glob.glob(str(SETTINGS.cache_dir / "morning_*.json"))
+        + glob.glob(str(SETTINGS.cache_dir / "evening_*.json")),
+        key=lambda p: Path(p).stat().st_mtime,
+        reverse=True,
+    )
+    if not files:
+        return None
+    if require_content:
+        for f in files:
+            if _cache_has_content(Path(f)):
+                return Path(f).stem
+        return None  # 没有任何含内容的缓存
+    return Path(files[0]).stem
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--cache", required=True, help="缓存文件名（不含扩展名），例如 evening_2026-05-27")
+    p.add_argument("--to", default=None, help="覆盖收件人 UserId（管道分隔）")
+    p.add_argument("--luoyihe", action="store_true", help="仅发给 LuoYiHe（测试用）")
+    args = p.parse_args()
+
+    to_user = None
+    if args.to:
+        to_user = args.to
+    elif args.luoyihe:
+        to_user = "LuoYiHe"
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+    ok, results = resend(args.cache, to_user=to_user)
     print(f"\nresend done: sent={ok}, parts={len(results)}")
     for r in results:
         print(" ", r)

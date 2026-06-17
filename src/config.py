@@ -27,6 +27,15 @@ class Settings:
     to_user: str
     callback_token: str
     callback_aes_key: str
+    contact_secret: str  # 通讯录同步 Secret，用于 join_qrcode 等通讯录管理接口
+
+    # 「微信插件」关注二维码（来自企业微信后台「我的企业 → 微信插件」，静态，无 API）
+    wx_plugin_url: str   # 微信插件链接，形如 https://work.weixin.qq.com/...（可本地生成二维码）
+    wx_plugin_qr: str    # 后台下载好的二维码图片路径（优先用它，原样展示，最稳）
+
+    # 「加入企业」邀请链接（后台「邀请成员」生成，形如 work.weixin.qq.com/join/...）
+    # 走"微信请求获取你的账号"授权流程，用微信绑定手机号一键加入；过期了在 .env 换一行即可。
+    join_url: str
 
     # OpenAI
     openai_api_key: str
@@ -40,6 +49,9 @@ class Settings:
     # Source
     spacenews_rss: str
     opml_path: Path
+    nasa_rss: str
+    esa_rss: str
+    news_max_total: int  # 国际新闻三源(SpaceNews/NASA/ESA)卡片总上限，>8 自动分多条消息
 
     # Schedule
     morning_hour: int | None
@@ -69,6 +81,10 @@ def load() -> Settings:
         to_user=_req("WECOM_TO_USER"),
         callback_token=_req("WECOM_CALLBACK_TOKEN"),
         callback_aes_key=_req("WECOM_CALLBACK_AES_KEY"),
+        contact_secret=os.getenv("WECOM_CONTACT_SECRET", ""),
+        wx_plugin_url=os.getenv("WECOM_WX_PLUGIN_URL", "").strip(),
+        wx_plugin_qr=os.getenv("WECOM_WX_PLUGIN_QR", "").strip(),
+        join_url=os.getenv("WECOM_JOIN_URL", "").strip(),
         openai_api_key=_req("OPENAI_API_KEY"),
         openai_base_url=_req("OPENAI_BASE_URL"),
         openai_model=_req("OPENAI_MODEL"),
@@ -76,6 +92,9 @@ def load() -> Settings:
         server_port=int(os.getenv("SERVER_PORT", "8503")),
         spacenews_rss=os.getenv("SPACENEWS_RSS", "https://spacenews.com/feed/"),
         opml_path=ROOT / os.getenv("OPML_PATH", "data/zlzchat.opml"),
+        nasa_rss=os.getenv("NASA_RSS", "https://www.nasa.gov/feed/").strip(),
+        esa_rss=os.getenv("ESA_RSS", "https://www.esa.int/rssfeed/Our_Activities/Space_News").strip(),
+        news_max_total=int(os.getenv("NEWS_MAX_TOTAL", "12")),
         morning_hour=_opt_int("DAILY_MORNING_HOUR"),
         morning_minute=int(os.getenv("DAILY_MORNING_MINUTE", "0")),
         evening_hour=_opt_int("DAILY_EVENING_HOUR"),
