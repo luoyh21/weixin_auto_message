@@ -1,0 +1,29 @@
+name: scrape-topic
+
+on:
+  workflow_dispatch:
+    inputs:
+      topic_id:
+        description: "专题 ID"
+        required: false
+        default: "space-tug"
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests
+      - name: Scrape & push
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          TOPIC_ID: ${{ github.event.inputs.topic_id }}
+        run: python scripts/scrape_topic_remote.py
