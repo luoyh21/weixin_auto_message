@@ -39,6 +39,18 @@ log = logging.getLogger(__name__)
 
 app = FastAPI(title="weixin_auto_message")
 
+# ---- 挂载微信小程序后端（独立目录 weixin_miniprogram/backend），统一走本域名 /api ----
+try:
+    _WORKSPACE = ROOT.parent
+    if str(_WORKSPACE) not in sys.path:
+        sys.path.insert(0, str(_WORKSPACE))
+    from weixin_miniprogram.backend.api import router as _mp_router  # noqa: E402
+
+    app.include_router(_mp_router, prefix="/api")
+    log.info("mounted weixin_miniprogram backend at /api")
+except Exception as _e:  # noqa
+    logging.getLogger(__name__).warning("mini-program backend not mounted: %s", _e)
+
 _crypto = WXBizMsgCrypt(
     SETTINGS.callback_token,
     SETTINGS.callback_aes_key,
@@ -243,6 +255,19 @@ def news_page(batch: str, page_id: str):
     return FileResponse(p, media_type="text/html; charset=utf-8")
 
 
+@app.get("/t/{topic_id}/{page_id}")
+def topic_page(topic_id: str, page_id: str):
+    """专题情报的中文落地页（持久，不参与 news_pages 轮转）。"""
+    try:
+        from weixin_miniprogram.backend.topic_intel import topic_page_file
+    except Exception:
+        raise HTTPException(status_code=404, detail="topic page not available")
+    p = topic_page_file(topic_id, page_id)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="topic page not found")
+    return FileResponse(p, media_type="text/html; charset=utf-8")
+
+
 @app.post("/ingest/spacenews")
 async def ingest_spacenews(request: Request, x_auth_token: str | None = Header(default=None)):
     expected = os.getenv(INGEST_TOKEN_ENV, "")
@@ -255,6 +280,23 @@ async def ingest_spacenews(request: Request, x_auth_token: str | None = Header(d
     if not isinstance(items, list):
         raise HTTPException(status_code=400, detail="expected list of articles or {articles:[...]}")
     path = save_ingest(items)
+    return JSONResponse({"ok": True, "saved": str(path), "count": len(items)})
+
+
+@app.post("/ingest/topic")
+async def ingest_topic(request: Request, x_auth_token: str | None = Header(default=None)):
+    """专题情报海外抓取入站（复用 SPACENEWS_INGEST_TOKEN）。"""
+    expected = os.getenv(INGEST_TOKEN_ENV, "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="ingest disabled (no token configured)")
+    if x_auth_token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+    payload = await request.json()
+    items = payload.get("articles") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="expected list of articles or {articles:[...]}")
+    from .topic_ingest import save_ingest as _save_topic
+    path = _save_topic(items)
     return JSONResponse({"ok": True, "saved": str(path), "count": len(items)})
 
 
