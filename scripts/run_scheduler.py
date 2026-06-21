@@ -38,6 +38,20 @@ def update_zlzchat_feeds():
         except Exception as e:
             logging.exception("zlzchat updateFeed wxsId=%s failed: %s", wxs_id, e)
 
+
+def sync_gzh_store():
+    """每隔几小时刷新一次公众号 RSS 并入独立库，保证小程序能看到每条更新。
+
+    与每日推送解耦：先 updateFeed 让 zlzchat 拉取新文章，再抓 OPML 并入库。
+    """
+    update_zlzchat_feeds()
+    try:
+        from src.gzh_store import refresh as _gzh_refresh  # noqa: E402
+        n = _gzh_refresh(hours=72)
+        logging.info("gzh_store sync: +%d new", n)
+    except Exception as e:
+        logging.exception("gzh_store sync failed: %s", e)
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -182,6 +196,15 @@ def main():
             id="evening_brief", misfire_grace_time=600,
         )
         enabled.append(f"晚间 {SETTINGS.evening_hour:02d}:{SETTINGS.evening_minute:02d}")
+
+    # 每 6 小时刷新一次公众号 RSS 并入独立库（与推送解耦），保证小程序不漏每条更新
+    _gzh_start = datetime.now().replace(minute=10, second=0, microsecond=0)
+    sched.add_job(
+        sync_gzh_store,
+        trigger=IntervalTrigger(hours=6, start_date=_gzh_start, timezone=SETTINGS.daily_tz),
+        id="gzh_store_sync", misfire_grace_time=1800,
+    )
+    enabled.append("公众号库同步 每6小时")
 
     # 每天 03:30 把「微信插件」二维码按 .env 配置同步一次（静态来源，便宜）
     sched.add_job(

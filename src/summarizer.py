@@ -139,6 +139,36 @@ def daily_summary(
     return text
 
 
+SYS_PAPER = (
+    "你是航天领域的资料编辑。用户会给你一篇学术论文 / 技术报告的标题、要点提示，"
+    "以及一段可能含目录、页码、作者信息或排版噪声的原文片段。\n"
+    "请用简体中文写一段**连贯的介绍**，说明这篇论文/报告做了什么、研究或盘点了哪些内容、"
+    "得出什么结论或有什么意义。要求：\n"
+    "1. 3~6 句话，自然成段，面向科普读者；\n"
+    "2. **绝不**罗列目录、章节号、页码，**不要**逐句翻译原文，不要出现参考文献、邮箱、版权声明等噪声；\n"
+    "3. 聚焦『做了什么、有什么价值』，可适当结合要点提示；\n"
+    "4. 不要使用『本文』之外的第一人称，不要加标题或编号。"
+)
+
+
+def summarize_paper(title: str, raw_text: str = "", hint: str = "") -> str:
+    """把学术论文/报告（常为 PDF，正文是目录或排版噪声）总结成一段中文简介。"""
+    user = (
+        f"标题：{title}\n\n"
+        f"要点提示：{hint or '（无）'}\n\n"
+        f"原文片段（可能含目录/噪声，仅供参考）：\n{(raw_text or '')[:4000]}"
+    )
+    resp = client().chat.completions.create(
+        model=SETTINGS.openai_model,
+        messages=[
+            {"role": "system", "content": SYS_PAPER},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.3,
+    )
+    return resp.choices[0].message.content.strip()
+
+
 SYS_QA = (
     "你是一个航天主题的助手。你会得到『最近一次抓取的新闻原始材料』作为背景知识。\n"
     "请用简体中文、简洁友好地回答用户的提问。\n"

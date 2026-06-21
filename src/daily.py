@@ -565,14 +565,23 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
     # - 早间速递：固定取过去 24 小时（覆盖前一天 8:00 至当天 8:00 这段所有更新）
     # - 晚间速递：完全不发公众号（避免一日内重复且打扰）
     # - 其它（手工 run_once --session daily 等）：复用 SpaceNews 同窗口
+    # 公众号(OPML)一天只抓一次（早间），用较大窗口兜底 zlzchat 聚合器的抓取延迟；
+    # 即便文章晚几天才进 feed，只要落在窗口内就能补上，dedup 保证不会重复推送。
     if session_key == "morning":
-        opml_hours = int(os.getenv("OPML_MORNING_HOURS", "24") or 24)
+        opml_hours = int(os.getenv("OPML_MORNING_HOURS", "96") or 96)
     elif session_key == "evening":
         opml_hours = 0
     else:
         opml_hours = hrs
     if opml_hours > 0:
         opml = [e.to_dict() for e in fetch_opml_recent(hours=opml_hours)]
+        # 抓到即入独立公众号库（dedup 之前），保证每条更新都能进小程序，
+        # 不受「推送去重」或「当次是否被选入摘要」影响。
+        try:
+            from . import gzh_store
+            gzh_store.add(opml)
+        except Exception as e:
+            log.warning("gzh_store.add failed: %s", e)
     else:
         log.info("opml skipped this session (%s)", session_key)
         opml = []
@@ -610,8 +619,15 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
     hero_image_url = hero_candidates[0][0] if hero_candidates else ""
 
     # ----- 抖音账号近 N 小时作品（作为卡片附加） -----
-    dy_hours_env = os.getenv("DOUYIN_WINDOW_HOURS", "").strip()
-    dy_hours = int(dy_hours_env) if dy_hours_env else hrs
+    # 按班次区分窗口，避免两班重复：早间(08:00)回溯 16h→到前一天 16:00；晚间(16:00)回溯 8h→到当天 08:00。
+    # 两班首尾衔接、刚好无缝且不重叠。其它会话回落到 DOUYIN_WINDOW_HOURS 或抓取窗口。
+    if session_key == "morning":
+        dy_hours = int(os.getenv("DOUYIN_MORNING_HOURS", "16") or 16)
+    elif session_key == "evening":
+        dy_hours = int(os.getenv("DOUYIN_EVENING_HOURS", "8") or 8)
+    else:
+        dy_hours_env = os.getenv("DOUYIN_WINDOW_HOURS", "").strip()
+        dy_hours = int(dy_hours_env) if dy_hours_env else hrs
     dy_max = int(os.getenv("DOUYIN_MAX_TOTAL", "0") or 0)
     dy_per_user = int(os.getenv("DOUYIN_PER_USER_LIMIT", "1") or 1)
     try:
