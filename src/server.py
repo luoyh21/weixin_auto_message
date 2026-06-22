@@ -49,6 +49,13 @@ try:
 
     app.include_router(_mp_router, prefix="/api")
     log.info("mounted weixin_miniprogram backend at /api")
+
+    # 启动即后台预热新闻缓存，避免第一个用户请求撞上冷构建（曾达 ~13s）。
+    try:
+        from weixin_miniprogram.backend import news_store as _news_store  # noqa: E402
+        threading.Thread(target=_news_store.warm, daemon=True).start()
+    except Exception as _we:  # noqa
+        logging.getLogger(__name__).warning("news cache warm skip: %s", _we)
 except Exception as _e:  # noqa
     logging.getLogger(__name__).warning("mini-program backend not mounted: %s", _e)
 

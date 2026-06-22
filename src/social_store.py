@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STORE_PATH = ROOT / "data" / "social_store.json"
 STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-RETENTION_DAYS = 15
+RETENTION_DAYS = 30
 MAX_PER_INGEST = 40  # 单次入库最多富化多少条，挡住马斯克高频刷屏导致的 LLM 费用失控
 
 _LOCK = threading.Lock()

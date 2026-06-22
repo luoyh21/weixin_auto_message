@@ -1,4 +1,4 @@
-"""周期性清理：只保留近 N 天（默认 15）的中间文件/缓存。
+"""周期性清理：只保留近 N 天（默认 30，约一个月）的中间文件/缓存。
 
 涉及目录（按文件 mtime 判断）：
     data/ingest/*.json            远端 scraper 推上来的原始抓取批
@@ -63,7 +63,7 @@ def _prune_subdirs(folder: Path, *, days: int) -> int:
     return removed
 
 
-def run(days: int = 15) -> dict:
+def run(days: int = 30) -> dict:
     """主入口：清理所有受管目录，返回每个目录删除计数。"""
     stats = {
         "ingest":          _prune_files(DATA / "ingest",          patterns=("*.json",),       days=days),
