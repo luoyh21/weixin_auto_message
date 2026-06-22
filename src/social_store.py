@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +24,9 @@ STORE_PATH = ROOT / "data" / "social_store.json"
 STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 RETENTION_DAYS = 30
-MAX_PER_INGEST = 40  # 单次入库最多富化多少条，挡住马斯克高频刷屏导致的 LLM 费用失控
+# 单次入库最多富化多少条，挡住高频刷屏导致的 LLM 费用失控。
+# 可用环境变量 SOCIAL_MAX_PER_INGEST 临时调大（如一次性回填历史）。
+MAX_PER_INGEST = int(os.getenv("SOCIAL_MAX_PER_INGEST", "40"))
 
 _LOCK = threading.Lock()
 

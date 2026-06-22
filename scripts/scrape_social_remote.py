@@ -81,6 +81,30 @@ def _strip_html(s: str) -> str:
     return " ".join(BeautifulSoup(s, "html.parser").get_text(" ").split())
 
 
+def _html_to_text(s: str) -> str:
+    """HTML→纯文本，但**保留链接**：把 <a href="url">文本</a> 转成 "文本 url"。
+
+    Truth Social 的 content 是带 <a> 的 HTML，直接 get_text 会丢掉 URL；
+    这里把 href 显式拼回正文，方便 LLM 在译文里原样保留链接。
+    """
+    if not s:
+        return ""
+    soup = BeautifulSoup(s, "html.parser")
+    for a in soup.find_all("a"):
+        href = (a.get("href") or "").strip()
+        txt = a.get_text(" ").strip()
+        if href and href not in txt:
+            a.replace_with(f"{txt} {href}".strip())
+    return " ".join(soup.get_text(" ").split())
+
+
+_WORD_RE = re.compile(r"\S+")
+
+
+def _word_count(text: str) -> int:
+    return len(_WORD_RE.findall(text or ""))
+
+
 def _parse_iso(s: str) -> datetime | None:
     if not s:
         return None
@@ -127,7 +151,7 @@ def fetch_truth(users: list[str], cutoff: datetime, archive_url: str) -> list[di
         dt = _parse_iso(post.get("created_at", ""))
         if dt is None or dt < cutoff:
             continue
-        text = _strip_html(post.get("content", ""))
+        text = _html_to_text(post.get("content", ""))
         media = post.get("media") or []
         images = [m for m in media if isinstance(m, str)
                   and not m.lower().split("?")[0].endswith((".mp4", ".mov", ".m4v", ".webm"))]
@@ -208,9 +232,17 @@ def fetch_x(users: list[str], cutoff: datetime, instances: list[str]) -> list[di
             if dt < cutoff:
                 continue
             link = entry.get("link", "").strip()
-            text = _strip_html(entry.get("title", "")) or _strip_html(entry.get("summary", ""))
-            if text.lower().startswith("rt by") or text.startswith("R to @"):
-                continue  # 跳过转推/回复噪声
+            raw = _strip_html(entry.get("title", "")) or _strip_html(entry.get("summary", ""))
+            low = raw.lower()
+            if low.startswith("rt by"):
+                continue  # 纯转推不是本人言论，跳过
+            text = raw
+            is_reply = low.startswith("r to @")
+            if is_reply:
+                # 去掉 "R to @user:" 前缀；回复需正文 >30 词才纳入考虑
+                text = re.sub(r"^R to @\S+:?\s*", "", raw, flags=re.I).strip()
+                if _word_count(text) <= 30:
+                    continue
             images = _img_from_summary(entry.get("summary", ""))
             if not text and not images:
                 continue
