@@ -1,0 +1,49 @@
+name: scrape-social
+
+# 每天在 GitHub 海外 runner 上抓取政要社媒：
+#   - Truth Social（Trump）：读 CNN 托管的公开存档 JSON（零密钥）
+#   - X / 推特（Musk + Trump）：nitter 多实例 RSS
+# 规整后 POST 到国内服务器的 /ingest/social（复用 INGEST_URL / INGEST_TOKEN）。
+#
+# 配置：在仓库 Settings → Secrets 中复用现有
+#   INGEST_URL     例 http://your.server.cn:8503/ingest/spacenews
+#   INGEST_TOKEN   与服务器 .env 的 SPACENEWS_INGEST_TOKEN 一致
+# 可选 Variables：X_USERS / TRUTH_USERS / NITTER_INSTANCES / WINDOW_HOURS / TRUTH_ARCHIVE_URL
+
+on:
+  schedule:
+    # 一天 1 次。GitHub 共享 runner 常延迟 1~3h，这里标称 Beijing 05:40，
+    # 实际多半落在 07:xx 前，正好赶上 08:00 早间推送前由服务端富化完成。
+    - cron: "40 21 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install requests feedparser beautifulsoup4 lxml
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: scripts/scrape_social_remote.state.json
+          key: social-scrape-state-${{ github.run_id }}
+          restore-keys: |
+            social-scrape-state-
+      - name: Scrape & push
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
+          WINDOW_HOURS: ${{ vars.WINDOW_HOURS_SOCIAL || '26' }}
+          X_USERS: ${{ vars.X_USERS || 'elonmusk,realDonaldTrump' }}
+          TRUTH_USERS: ${{ vars.TRUTH_USERS || 'realDonaldTrump' }}
+          NITTER_INSTANCES: ${{ vars.NITTER_INSTANCES || '' }}
+          TRUTH_ARCHIVE_URL: ${{ vars.TRUTH_ARCHIVE_URL || 'https://ix.cnn.io/data/truth-social/truth_archive.json' }}
+        run: python scripts/scrape_social_remote.py

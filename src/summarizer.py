@@ -169,6 +169,59 @@ def summarize_paper(title: str, raw_text: str = "", hint: str = "") -> str:
     return resp.choices[0].message.content.strip()
 
 
+SYS_SOCIAL = (
+    "你是航天领域的情报分析编辑。用户会给你一条政要（如马斯克、特朗普）在社交媒体（X / Truth Social）"
+    "上的帖子原文（英文为主）。请判断它是否与『航天 / 火箭 / 卫星 / 太空 / NASA / SpaceX / 星舰 / 星链 / "
+    "登月 / 火星 / 太空军 / 商业航天 / 航天政策与预算』等航天器相关话题相关。\n"
+    "只输出一个 JSON 对象，不要任何额外文字、不要 markdown 代码块，字段如下：\n"
+    '{\n'
+    '  "relevant": true/false,        // 与航天器话题是否相关；完全无关填 false\n'
+    '  "title": "不超过20字的中文标题",  // relevant 为 false 时可留空\n'
+    '  "translation": "帖子原文的简体中文翻译",  // relevant 为 false 时可留空\n'
+    '  "analysis": "从航天视角的解读，不超过200字"  // relevant 为 false 时可留空\n'
+    "}\n"
+    "解读要点：这条帖子涉及哪个航天事项、释放了什么信号、对相关项目/政策/公司可能的影响。"
+    "客观、专业、简洁，不要复述原文，不要寒暄。"
+)
+
+
+def analyze_social_post(author_name: str, text: str, platform: str = "") -> dict:
+    """对一条政要社媒帖子做：相关性判定 + 中文翻译 + 航天视角解读。
+
+    返回 {relevant: bool, title: str, translation: str, analysis: str}。
+    任何异常都回退为 relevant=False，调用方据此丢弃。
+    """
+    import json as _json
+
+    user = (
+        f"作者：{author_name}\n"
+        f"平台：{platform or '社交媒体'}\n"
+        f"帖子原文：\n{(text or '').strip()[:2000]}"
+    )
+    try:
+        resp = client().chat.completions.create(
+            model=SETTINGS.openai_model,
+            messages=[
+                {"role": "system", "content": SYS_SOCIAL},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content.strip()
+        data = _json.loads(raw)
+    except Exception as e:
+        log.warning("analyze_social_post failed: %s", e)
+        return {"relevant": False, "title": "", "translation": "", "analysis": ""}
+
+    return {
+        "relevant": bool(data.get("relevant")),
+        "title": (data.get("title") or "").strip(),
+        "translation": (data.get("translation") or "").strip(),
+        "analysis": (data.get("analysis") or "").strip(),
+    }
+
+
 SYS_QA = (
     "你是一个航天主题的助手。你会得到『最近一次抓取的新闻原始材料』作为背景知识。\n"
     "请用简体中文、简洁友好地回答用户的提问。\n"

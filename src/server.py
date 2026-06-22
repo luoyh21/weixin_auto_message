@@ -34,6 +34,7 @@ from .join_qr import (  # noqa: E402
     ensure_invite_qrcode, INVITE_IMG_FILE,
 )
 import os  # noqa: E402
+import threading  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ def root():
     return {
         "ok": True,
         "service": "weixin_auto_message",
-        "endpoints": ["/weixin", "/news/{batch}/{id}", "/ingest/spacenews"],
+        "endpoints": ["/weixin", "/news/{batch}/{id}", "/ingest/spacenews", "/ingest/social"],
         "batches": latest_batches(),
     }
 
@@ -298,6 +299,34 @@ async def ingest_topic(request: Request, x_auth_token: str | None = Header(defau
     from .topic_ingest import save_ingest as _save_topic
     path = _save_topic(items)
     return JSONResponse({"ok": True, "saved": str(path), "count": len(items)})
+
+
+@app.post("/ingest/social")
+async def ingest_social(request: Request, x_auth_token: str | None = Header(default=None)):
+    """政要社媒海外抓取入站（复用 SPACENEWS_INGEST_TOKEN）。
+
+    收到原始帖子后立即返回，富化（LLM 相关性判定/翻译/解读）放后台线程跑，
+    避免 GH Actions 端等待大量 LLM 调用而超时。
+    """
+    expected = os.getenv(INGEST_TOKEN_ENV, "")
+    if not expected:
+        raise HTTPException(status_code=503, detail="ingest disabled (no token configured)")
+    if x_auth_token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+    payload = await request.json()
+    items = payload.get("posts") if isinstance(payload, dict) else payload
+    if not isinstance(items, list):
+        raise HTTPException(status_code=400, detail="expected list of posts or {posts:[...]}")
+
+    def _bg(posts: list):
+        try:
+            from .social_store import ingest_and_enrich
+            ingest_and_enrich(posts)
+        except Exception:
+            log.exception("social ingest enrich failed")
+
+    threading.Thread(target=_bg, args=(items,), daemon=True).start()
+    return JSONResponse({"ok": True, "received": len(items)})
 
 
 @app.get("/weixin")

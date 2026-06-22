@@ -73,6 +73,12 @@ def run(days: int = 15) -> dict:
         "dy_pages":        _prune_files(DATA / "dy_pages",        patterns=("*.html",),       days=days),
         "news_pages":      _prune_subdirs(DATA / "news_pages",                                days=days),
     }
+    # 政要社媒库按发布时间自带滚动清理（RETENTION_DAYS），这里再触发一次兜底。
+    try:
+        from .social_store import prune as _social_prune
+        stats["social_store"] = _social_prune()
+    except Exception as e:
+        log.warning("social_store prune failed: %s", e)
     log.info("cleanup summary (keep %dd): %s", days, stats)
     return stats
 

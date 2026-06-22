@@ -1,35 +1,17 @@
 {
   "batches": [
     {
-      "id": "evening_2026-06-16",
-      "created_at": 1781596910,
+      "id": "morning_2026-06-21",
+      "created_at": 1782000037,
       "page_ids": [
-        "01-nebraska-s-wide-rolling-domain",
-        "02-astrobotic-showcases-griffin-1-lander-ahead-of-e",
-        "03-astrobotic-unveils-griffin-moon-base-ii-lander",
-        "04-explore-jpl-to-take-place-oct-10-11"
+        "01-astrobotic-says-sale-to-voyager-will-allow-it-to"
       ]
     },
     {
-      "id": "morning_2026-06-17",
-      "created_at": 1781654584,
+      "id": "morning_2026-06-22",
+      "created_at": 1782086447,
       "page_ids": [
-        "01-astrobotic-unveils-griffin-1-lunar-lander",
-        "02-swiss-decision-to-not-contribute-to-copernicus-t",
-        "03-the-spacenews-space-unicorn-tracker",
-        "04-katalyst-space-raises-12-million-for-geo-servici",
-        "05-pilogic-partners-with-air-force-lab-to-test-sate",
-        "06-a-un-agency-that-works-for-us-space",
-        "07-geospatial-industry-launches-maritime-initiative",
-        "08-deep-space-network-antenna-mishap-blamed-on-poor",
-        "09-tianwen-2-makes-series-of-burns-on-approach-to-a",
-        "10-nasa-s-webb-catches-exoplanet-getting-roasted",
-        "11-astronaut-jessica-meir-assists-with-hardware-upd",
-        "12-nasa-webb-hubble-reveal-history-of-relic-of-milk",
-        "13-nasa-s-quantum-lab-aboard-space-station-gets-chi",
-        "14-nasa-uses-machine-learning-to-enhance-flash-floo",
-        "15-department-of-health-and-human-services-digital-",
-        "16-aurora-australis"
+        "01-what-s-happening-in-space-policy-june-21-27-2026"
       ]
     }
   ]

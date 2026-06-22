@@ -10,3 +10,8 @@ data/cache/
 .vscode/
 *.html
 data/*
+
+# 本地对话转储/记录，勿入库
+docs/conversation.md
+docs/conversation_raw.jsonl
+logs/
