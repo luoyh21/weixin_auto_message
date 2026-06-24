@@ -172,32 +172,31 @@ def summarize_paper(title: str, raw_text: str = "", hint: str = "") -> str:
 SYS_SOCIAL = (
     "你是航天领域的情报分析编辑。用户会给你一条政要（如马斯克、特朗普）在社交媒体（X / Truth Social）"
     "上的帖子原文（英文为主）。\n"
-    "【判定口径——只认真·航天/太空，从严】relevant=true 仅当帖子**明确涉及**以下之一：\n"
+    "**无论内容是否涉及航天，都要给出中文标题和整段中文翻译**；是否给出『解读』则取决于内容是否与航天器/太空相关。\n"
+    "【space_related 判定口径】仅当帖子**明确涉及**以下之一才为 true：\n"
     "  · 火箭/运载器、卫星、飞船、载人航天、空间站、星舰(Starship)、星链(Starlink)；\n"
     "  · 火箭发射 / 试飞 / 在轨任务 / 航天事故或里程碑；\n"
     "  · NASA / SpaceX / 蓝色起源 等航天机构与商业航天公司及其动态；\n"
     "  · 太空军(Space Force) 及太空军事 / 反卫星 / 太空态势感知 / 天基防御；\n"
     "  · 登月 / 火星 / 深空探测 / 行星科学 / 太空望远镜；\n"
     "  · 与**航天**直接相关的政策 / 预算 / 立法 / 拨款 / 监管（FAA 航天发射许可、FCC 卫星等）。\n"
-    "【明确排除（一律 relevant=false）】普通航空（民航、战斗机、轰炸机如 B-2、飞行表演、空中编队）、"
-    "无人机（非航天用途）、海军/陆军/常规军事、核武器本身、恐怖袭击、国内政治、媒体口水、移民、"
-    "关税、体育等——即便沾『军事/航空/国防』，只要不是**太空**领域就填 false。\n"
+    "  普通航空、无人机、常规军事、国内政治、关税、体育等与太空无关的内容，space_related=false。\n"
     "只输出一个 JSON 对象，不要任何额外文字、不要 markdown 代码块，字段如下：\n"
     '{\n'
-    '  "relevant": true/false,\n'
-    '  "title": "不超过20字的中文标题",   // false 时留空\n'
-    '  "translation": "把帖子正文**整段翻译成简体中文**（务必是中文，不能照抄英文原文）；翻译时仅将其中的链接(URL)、@用户名、#话题标签按原样保留、不翻译、不删除，其余文字一律译成中文",  // false 时留空\n'
-    '  "analysis": "仅当确有必要（帖子含实质航天信息、值得点评其信号/影响）时给出不超过200字的航天视角解读；若只是转述或无可深入之处，则留空字符串 \\"\\""  // false 时留空\n'
+    '  "space_related": true/false,\n'
+    '  "title": "不超过20字的中文标题（必填）",\n'
+    '  "translation": "把帖子正文**整段翻译成简体中文**（务必是中文，不能照抄英文原文；必填）；翻译时仅将其中的链接(URL)、@用户名、#话题标签按原样保留、不翻译、不删除，其余文字一律译成中文",\n'
+    '  "analysis": "仅当 space_related=true 且确有可点评之处（实质航天信息、值得点评其信号/影响）时，给出不超过200字的航天视角解读；其余情况（与航天无关、或只是转述/无可深入）一律留空字符串 \\"\\""\n'
     "}\n"
-    "解读要客观专业、不复述原文、不寒暄；可有可无时一律留空。"
+    "解读要客观专业、不复述原文、不寒暄；与航天无关或无可深入之处一律留空。"
 )
 
 
 def analyze_social_post(author_name: str, text: str, platform: str = "") -> dict:
-    """对一条政要社媒帖子做：相关性判定 + 中文翻译 + 航天视角解读。
+    """对一条政要社媒帖子做：中文标题 + 整段中文翻译 + （仅航天相关时）航天视角解读。
 
-    返回 {relevant: bool, title: str, translation: str, analysis: str}。
-    任何异常都回退为 relevant=False，调用方据此丢弃。
+    返回 {space_related: bool, title: str, translation: str, analysis: str}。
+    帖子一律入库展示，不再按相关性丢弃；异常时回退为空字段（仍可入库，展示原文）。
     """
     import json as _json
 
@@ -220,10 +219,10 @@ def analyze_social_post(author_name: str, text: str, platform: str = "") -> dict
         data = _json.loads(raw)
     except Exception as e:
         log.warning("analyze_social_post failed: %s", e)
-        return {"relevant": False, "title": "", "translation": "", "analysis": ""}
+        return {"space_related": False, "title": "", "translation": "", "analysis": ""}
 
     return {
-        "relevant": bool(data.get("relevant")),
+        "space_related": bool(data.get("space_related")),
         "title": (data.get("title") or "").strip(),
         "translation": (data.get("translation") or "").strip(),
         "analysis": (data.get("analysis") or "").strip(),

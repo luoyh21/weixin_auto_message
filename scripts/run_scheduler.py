@@ -88,7 +88,7 @@ def remind_replace_qrcode():
 
 def daily_cleanup():
     try:
-        run_cleanup(days=30)
+        run_cleanup(days=14)
     except Exception as e:
         logging.exception("cleanup failed: %s", e)
 
@@ -223,7 +223,7 @@ def main():
     )
     enabled.append("二维码更换提醒 每6天09:30→LuoYiHe")
 
-    # 每天 03:45 清理：ingest / cache / translate_cache / img_cache / dy_pages / news_pages，仅保留 30 天（约一个月）
+    # 每天 03:45 清理：ingest / cache / translate_cache / img_cache / dy_pages / news_pages，仅保留 14 天（约两周）
     sched.add_job(
         daily_cleanup,
         trigger=CronTrigger(hour=3, minute=45, timezone=SETTINGS.daily_tz),

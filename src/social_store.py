@@ -2,11 +2,11 @@
 
 与每日推送解耦，单独维护一份 data/social_store.json：
 - 海外 GH Actions 抓到的原始帖子 POST 到 /ingest/social；
-- 服务端对每条**新**帖做 LLM 相关性判定：与航天器完全无关的直接丢弃、不入库；
-- 相关的翻译成中文 + 给出航天视角解读，连同时间/渠道/原文/图片一起入库；
+- 服务端对每条**新**帖做 LLM 处理：一律生成中文标题 + 整段翻译并入库（不再按是否航天过滤）；
+- 仅当帖子与航天器/太空相关时附带航天视角解读，连同时间/渠道/原文/图片一起入库；
 - 小程序后端从这里读取，渲染「政要社媒」栏目。
 
-存储为按 key=``platform:post_id`` 索引的 dict，自带 RETENTION_DAYS 滚动清理。
+存储为按 key=``platform:post_id`` 索引的 dict，自带 RETENTION_DAYS 滚动清理（近两周）。
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parent.parent
 STORE_PATH = ROOT / "data" / "social_store.json"
 STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-RETENTION_DAYS = 30
+RETENTION_DAYS = 14
 # 单次入库最多富化多少条，挡住高频刷屏导致的 LLM 费用失控。
 # 可用环境变量 SOCIAL_MAX_PER_INGEST 临时调大（如一次性回填历史）。
 MAX_PER_INGEST = int(os.getenv("SOCIAL_MAX_PER_INGEST", "40"))
@@ -81,9 +81,10 @@ def _prune(store: dict[str, dict]) -> None:
 
 
 def ingest_and_enrich(posts: list[dict]) -> int:
-    """对一批原始帖子做去重 + LLM 富化后入库。返回实际新增（相关且入库）的条数。
+    """对一批原始帖子做去重 + LLM 富化后入库。返回实际新增入库的条数。
 
-    每条只在**首次见到**时调用一次 LLM；相关性为 False 的不入库（但记入 skip 以免重复判定）。
+    每条只在**首次见到**时调用一次 LLM：一律生成中文标题+翻译并入库，
+    解读仅在与航天相关时附带（不再因『不相关』而丢弃）。
     """
     from .summarizer import analyze_social_post
 
@@ -111,10 +112,18 @@ def ingest_and_enrich(posts: list[dict]) -> int:
         if not text:
             continue
         res = analyze_social_post(p.get("author_name", ""), text, p.get("platform", ""))
-        if not res.get("relevant"):
-            log.info("social skip (irrelevant): %s %s", p.get("author_name"), text[:50])
-            continue
-        images = p.get("images") or []
+        # 海外回传的图片字节 → 落盘 → 用国内可达的 /relay-img URL（推特/Truth 国内直连不到）。
+        # 注意：绝不回落到 images[0] 这类 nitter/twimg/truthsocial 原始地址——国内手机
+        # 根本加载不到，存了只会渲染成坏图。中继失败就留空，让卡片无图渲染。
+        image_url = ""
+        if p.get("image_b64"):
+            try:
+                from . import relay_img as _relay
+                rkey = _relay.store_b64(p["image_b64"], p.get("image_mime", "image/jpeg"))
+                if rkey:
+                    image_url = _relay.url(rkey)
+            except Exception:
+                log.exception("social image relay store failed")
         enriched[_key(p)] = {
             "platform": p.get("platform", ""),
             "channel": CHANNEL_LABEL.get(p.get("platform", ""), p.get("platform", "")),
@@ -127,7 +136,7 @@ def ingest_and_enrich(posts: list[dict]) -> int:
             "original": text,
             "translation": res.get("translation", ""),
             "analysis": res.get("analysis", ""),
-            "image": images[0] if images else "",
+            "image": image_url,
             "first_seen": _now().isoformat(),
         }
         added += 1
@@ -138,7 +147,7 @@ def ingest_and_enrich(posts: list[dict]) -> int:
             store.update(enriched)
             _prune(store)
             _save(store)
-    log.info("social ingest: %d posts in, %d relevant stored", len(posts), added)
+    log.info("social ingest: %d posts in, %d stored", len(posts), added)
     return added
 
 

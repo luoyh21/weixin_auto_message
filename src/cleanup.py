@@ -1,4 +1,4 @@
-"""周期性清理：只保留近 N 天（默认 30，约一个月）的中间文件/缓存。
+"""周期性清理：只保留近 N 天（默认 14，约两周）的中间文件/缓存。
 
 涉及目录（按文件 mtime 判断）：
     data/ingest/*.json            远端 scraper 推上来的原始抓取批
@@ -63,7 +63,7 @@ def _prune_subdirs(folder: Path, *, days: int) -> int:
     return removed
 
 
-def run(days: int = 30) -> dict:
+def run(days: int = 14) -> dict:
     """主入口：清理所有受管目录，返回每个目录删除计数。"""
     stats = {
         "ingest":          _prune_files(DATA / "ingest",          patterns=("*.json",),       days=days),
@@ -71,6 +71,7 @@ def run(days: int = 30) -> dict:
         "translate_cache": _prune_files(DATA / "translate_cache", patterns=("*.txt",),        days=days),
         "img_cache":       _prune_files(DATA / "img_cache",       patterns=("*.bin", "*.ct"), days=days),
         "dy_pages":        _prune_files(DATA / "dy_pages",        patterns=("*.html",),       days=days),
+        "relay_img":       _prune_files(DATA / "relay_img",       patterns=("*.bin", "*.ct"), days=days),
         "news_pages":      _prune_subdirs(DATA / "news_pages",                                days=days),
     }
     # 政要社媒库按发布时间自带滚动清理（RETENTION_DAYS），这里再触发一次兜底。

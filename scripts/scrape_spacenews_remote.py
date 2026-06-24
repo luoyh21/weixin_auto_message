@@ -34,6 +34,8 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
+import img_relay
+
 
 # 多个 UA 轮换，降低被识别为爬虫的概率
 USER_AGENTS = [
@@ -425,12 +427,25 @@ def main() -> int:
         print("No new items across all feeds.")
         return 0
 
+    # 海外把「国内拿不到/盗链」host 的图下载好回传（如 nasaspaceflight / esa），
+    # 国内 i0.wp.com / nasa.gov 等直连可用的不回传以省流量。
+    relayed = 0
+    for it in items:
+        u = it.get("image_url") or ""
+        if u and img_relay.need_relay(u):
+            b64, mime = img_relay.download_as_b64(u, referer=it.get("link") or "")
+            if b64:
+                it["image_b64"] = b64
+                it["image_mime"] = mime
+                relayed += 1
+    print(f"relayed {relayed}/{len(items)} intl images")
+
     print(f"POST {len(items)} items -> {ingest_url}")
     resp = requests.post(
         ingest_url,
         headers={"X-Auth-Token": token, "Content-Type": "application/json"},
         data=json.dumps({"articles": items}, ensure_ascii=False).encode("utf-8"),
-        timeout=30,
+        timeout=120,
     )
     print(resp.status_code, resp.text[:400])
     resp.raise_for_status()

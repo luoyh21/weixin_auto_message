@@ -27,8 +27,8 @@ _ROOT = Path(__file__).resolve().parent.parent
 _STORE = _ROOT / "data" / "gzh_store.json"
 _LOCK = threading.Lock()
 
-# 保留多久（天）。小程序一般看近一周，留足冗余，但避免无限增长。
-RETENTION_DAYS = 30
+# 保留多久（天）。小程序看近两周，留足冗余，但避免无限增长。
+RETENTION_DAYS = 14
 
 
 def _key(link: str, title: str = "") -> str:

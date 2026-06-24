@@ -49,6 +49,8 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
+import img_relay
+
 USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -303,12 +305,35 @@ def main() -> int:
         print("No new social posts in window.")
         return 0
 
+    # 海外把首图下载好回传（国内拿不到推特/Truth 图）。多源依次尝试，命中即停：
+    #   X   ：① nitter /pic 直连（与 RSS 同实例，机房可达）② 还原成 pbs.twimg.com
+    #         ③ 以上各自再走 weserv 公共代理兜底
+    #   Truth：① static-assets CDN 直连 ② weserv 兜底
+    # 之所以 nitter 直连优先：pbs.twimg.com 常封 GitHub Actions 机房 IP，而 nitter
+    # 既然能给出 RSS，其 /pic 代理通常也可达，是最稳的取图路径。
+    relayed = 0
+    for p in fresh:
+        imgs = p.get("images") or []
+        if not imgs:
+            continue
+        raw = imgs[0]
+        if p.get("platform") == "x":
+            candidates = [raw, img_relay.nitter_to_twimg(raw)]
+        else:
+            candidates = [raw]
+        b64, mime = img_relay.download_best(candidates, referer=p.get("url") or "")
+        if b64:
+            p["image_b64"] = b64
+            p["image_mime"] = mime
+            relayed += 1
+    print(f"relayed {relayed}/{len(fresh)} social images")
+
     print(f"POST {len(fresh)} posts -> {social_url}")
     resp = requests.post(
         social_url,
         headers={"X-Auth-Token": token, "Content-Type": "application/json"},
         data=json.dumps({"posts": fresh}, ensure_ascii=False).encode("utf-8"),
-        timeout=40,
+        timeout=120,
     )
     print(resp.status_code, resp.text[:400])
     resp.raise_for_status()

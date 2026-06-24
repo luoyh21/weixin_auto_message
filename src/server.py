@@ -125,6 +125,21 @@ def img_proxy(u: str, r: str = ""):
     )
 
 
+@app.get("/relay-img/{key}")
+def relay_img(key: str):
+    """直供海外回传、已落盘的图片字节（推特/Truth/盗链图，国内可达）。"""
+    from . import relay_img as _relay
+    got = _relay.read(key)
+    if not got:
+        raise HTTPException(status_code=404, detail="not found")
+    data, ct = got
+    return Response(
+        content=data,
+        media_type=ct,
+        headers={"Cache-Control": "public, max-age=604800"},
+    )
+
+
 _JOIN_PAGE_TPL = """<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8">

@@ -21,7 +21,27 @@ INGEST_DIR.mkdir(parents=True, exist_ok=True)
 INGEST_TOKEN_ENV = "SPACENEWS_INGEST_TOKEN"
 
 
+def _relay_images(items: list[dict]) -> None:
+    """把海外回传的 image_b64 落盘成本地直供 URL，并从条目里删掉庞大的 b64，
+    避免 b64 被写进 ingest/cache 文件造成体积爆炸。"""
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        b64 = it.pop("image_b64", None)
+        mime = it.pop("image_mime", "image/jpeg")
+        if not b64:
+            continue
+        try:
+            from .relay_img import store_b64, url as relay_url
+            key = store_b64(b64, mime)
+            if key:
+                it["image_url"] = relay_url(key)
+        except Exception:
+            log.exception("ingest image relay store failed")
+
+
 def save_ingest(items: list[dict]) -> Path:
+    _relay_images(items)
     ts = int(time.time())
     p = INGEST_DIR / f"spacenews_{ts}.json"
     p.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
