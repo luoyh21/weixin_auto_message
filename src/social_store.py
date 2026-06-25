@@ -13,11 +13,111 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote, unquote
+
+import requests
 
 log = logging.getLogger(__name__)
+
+_WORD_RE = re.compile(r"\S+")
+
+
+def _word_count(text: str) -> int:
+    return len(_WORD_RE.findall(text or ""))
+
+
+# --------------------------------------------------------------------------
+# 社媒配图：服务端自取 + 本地缓存
+# --------------------------------------------------------------------------
+# 推特/Truth 的图国内服务器直连不到（pbs.twimg.com / nitter / truthsocial 均超时），
+# 但公共图片代理 images.weserv.nl 在国内可达、且能回源把这些图取回来。因此这里由
+# **服务端经 weserv 下载图片字节 → 落盘到 relay_img → 生成国内可达的 /relay-img URL**，
+# 不再依赖海外抓取端的 base64 回传（实测其链路不稳）。取不到就留空（默认不配图）。
+_IMG_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_NITTER_PIC_RE = re.compile(r"/pic/(.+)$")
+_IMG_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _source_image_url(url: str, platform: str) -> str:
+    """把抓取到的图片地址还原成可被 weserv 回源的真实源地址。
+
+    X 的 nitter ``/pic/media%2F...`` 代理 → 真实 ``pbs.twimg.com/media/...``；
+    Truth Social 的 static-assets 地址原样返回。
+    """
+    if not url:
+        return ""
+    if platform == "x":
+        m = _NITTER_PIC_RE.search(url)
+        if m:
+            path = unquote(m.group(1)).lstrip("/")
+            return "https://pbs.twimg.com/" + path
+    return url
+
+
+def _weserv(url: str) -> str:
+    stripped = url.split("://", 1)[-1]
+    return f"https://images.weserv.nl/?url={quote(stripped, safe='')}"
+
+
+def _download_via_weserv(src_url: str) -> tuple[bytes, str] | None:
+    """经 images.weserv.nl 下载图片字节，返回 (bytes, mime)。失败返回 None。"""
+    if not src_url:
+        return None
+    try:
+        r = requests.get(
+            _weserv(src_url),
+            headers={"User-Agent": _IMG_UA, "Accept": "image/*,*/*;q=0.8"},
+            timeout=25,
+        )
+    except Exception as e:
+        log.info("social image weserv fetch error %s: %s", src_url, e)
+        return None
+    if r.status_code != 200 or not r.content or len(r.content) > _IMG_MAX_BYTES:
+        log.info("social image weserv bad resp %s: HTTP %s size %s",
+                 src_url, r.status_code, len(r.content or b""))
+        return None
+    ct = (r.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
+    if not ct.startswith("image/"):
+        ct = "image/jpeg"
+    return r.content, ct
+
+
+def _resolve_image(p: dict) -> str:
+    """确定一条帖子最终可用、且国内可达的图片 URL（/relay-img/...）。取不到返回 ""。
+
+    优先用海外抓取端已下载好的字节（image_b64）；没有则服务端经 weserv 自取并本地缓存。
+    """
+    from . import relay_img as _relay
+
+    # 1) 海外抓取端已回传的字节（若该链路这次恰好成功）
+    if p.get("image_b64"):
+        try:
+            rkey = _relay.store_b64(p["image_b64"], p.get("image_mime", "image/jpeg"))
+            if rkey:
+                return _relay.url(rkey)
+        except Exception:
+            log.exception("social image relay(store_b64) failed")
+
+    # 2) 服务端经 weserv 下载源图，落盘本地缓存
+    images = p.get("images") or []
+    if images:
+        src = _source_image_url(images[0], p.get("platform", ""))
+        got = _download_via_weserv(src)
+        if got:
+            try:
+                rkey = _relay.store_bytes(got[0], got[1])
+                if rkey:
+                    return _relay.url(rkey)
+            except Exception:
+                log.exception("social image relay(store_bytes) failed")
+    return ""
 
 ROOT = Path(__file__).resolve().parent.parent
 STORE_PATH = ROOT / "data" / "social_store.json"
@@ -111,19 +211,13 @@ def ingest_and_enrich(posts: list[dict]) -> int:
         text = (p.get("text") or "").strip()
         if not text:
             continue
+        # 先确定配图（服务端经 weserv 自取并本地缓存为 /relay-img URL；取不到则空）。
+        image_url = _resolve_image(p)
+        # 取不到图片 且 正文 <15 词的帖子价值过低，直接丢弃（连 LLM 都不调用以省成本）。
+        # 有图的短帖（如配图 + 一句话）仍保留。
+        if not image_url and _word_count(text) < 15:
+            continue
         res = analyze_social_post(p.get("author_name", ""), text, p.get("platform", ""))
-        # 海外回传的图片字节 → 落盘 → 用国内可达的 /relay-img URL（推特/Truth 国内直连不到）。
-        # 注意：绝不回落到 images[0] 这类 nitter/twimg/truthsocial 原始地址——国内手机
-        # 根本加载不到，存了只会渲染成坏图。中继失败就留空，让卡片无图渲染。
-        image_url = ""
-        if p.get("image_b64"):
-            try:
-                from . import relay_img as _relay
-                rkey = _relay.store_b64(p["image_b64"], p.get("image_mime", "image/jpeg"))
-                if rkey:
-                    image_url = _relay.url(rkey)
-            except Exception:
-                log.exception("social image relay store failed")
         enriched[_key(p)] = {
             "platform": p.get("platform", ""),
             "channel": CHANNEL_LABEL.get(p.get("platform", ""), p.get("platform", "")),
