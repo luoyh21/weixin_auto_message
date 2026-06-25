@@ -89,12 +89,32 @@ def _download_via_weserv(src_url: str) -> tuple[bytes, str] | None:
     return r.content, ct
 
 
-def _resolve_image(p: dict) -> str:
-    """确定一条帖子最终可用、且国内可达的图片 URL（/relay-img/...）。取不到返回 ""。
+# 这些源站：国内服务器 / weserv 都取不到，但**用户手机能直连**（实测 truthsocial 的
+# static-assets CDN 在国内消费级网络可直接加载，而微信 <image> 不需要域名白名单）。
+# 对这类源，服务端中继失败时回退「直接存原始地址、让手机自行加载」。
+_PHONE_DIRECT_HOSTS = ("truthsocial.com",)
 
-    优先用海外抓取端已下载好的字节（image_b64）；没有则服务端经 weserv 自取并本地缓存。
+
+def _phone_loadable(url: str) -> bool:
+    h = url.split("://", 1)[-1].split("/", 1)[0].lower()
+    return any(h == d or h.endswith("." + d) for d in _PHONE_DIRECT_HOSTS)
+
+
+def _resolve_image(p: dict) -> str:
+    """确定一条帖子最终可用的图片 URL。取不到返回 ""。
+
+    取图优先级：
+      1) 海外抓取端已回传的字节（image_b64）→ 落盘本地 /relay-img；
+      2) 服务端经 weserv 自取源图 → 落盘本地 /relay-img（X 的 twimg 走得通，且国内手机
+         直连不到 twimg，必须中继）；
+      3) 中继失败兜底：若原图地址是**手机能直连**的源（如 truthsocial CDN），直接返回
+         原址，交给手机端 <image> 自行加载（服务器/weserv 取不到，但手机可达）。
     """
     from . import relay_img as _relay
+
+    images = p.get("images") or []
+    raw = images[0] if images else ""
+    platform = p.get("platform", "")
 
     # 1) 海外抓取端已回传的字节（若该链路这次恰好成功）
     if p.get("image_b64"):
@@ -106,10 +126,8 @@ def _resolve_image(p: dict) -> str:
             log.exception("social image relay(store_b64) failed")
 
     # 2) 服务端经 weserv 下载源图，落盘本地缓存
-    images = p.get("images") or []
-    if images:
-        src = _source_image_url(images[0], p.get("platform", ""))
-        got = _download_via_weserv(src)
+    if raw:
+        got = _download_via_weserv(_source_image_url(raw, platform))
         if got:
             try:
                 rkey = _relay.store_bytes(got[0], got[1])
@@ -117,6 +135,10 @@ def _resolve_image(p: dict) -> str:
                     return _relay.url(rkey)
             except Exception:
                 log.exception("social image relay(store_bytes) failed")
+
+    # 3) 中继失败 → 手机可直连的源（truthsocial）直接用原址；其它（nitter/twimg）留空
+    if raw and _phone_loadable(raw):
+        return raw
     return ""
 
 ROOT = Path(__file__).resolve().parent.parent
