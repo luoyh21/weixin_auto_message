@@ -25,7 +25,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 ZLZCHAT_BASE = "http://8.130.209.181:10082"
 ZLZCHAT_KEY = "lq3525926"
 # 需刷新的公众号 wxsId（与 OPML 里两个订阅源对应，格式须带 MP_WXS_ 前缀）
-ZLZCHAT_WXS_IDS = ["MP_WXS_3931671274", "MP_WXS_3094327014"]
+ZLZCHAT_WXS_IDS = ["MP_WXS_3931671274", "MP_WXS_3094327014", "MP_WXS_3927397899"]
 
 
 def update_zlzchat_feeds():

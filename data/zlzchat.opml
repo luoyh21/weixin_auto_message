@@ -6,5 +6,6 @@
     <body>
         <outline text="新航天青年说" xmlUrl="http://172.24.144.249:10082/feedAtom/ed538a8d367d09c5281fbd9023762695" type="rss" htmlUrl="http://172.24.144.249:10082/feedAtom/ed538a8d367d09c5281fbd9023762695"/>
         <outline text="国际太空" xmlUrl="http://172.24.144.249:10082/feedAtom/4baa35d78ffdbb627de2e1260f741983" type="rss" htmlUrl="http://172.24.144.249:10082/feedAtom/4baa35d78ffdbb627de2e1260f741983"/>
+        <outline text="你好太空" xmlUrl="http://172.24.144.249:10082/feedAtom/a8c4ff0ea84de9865ac088d703c07eb2" type="rss" htmlUrl="http://172.24.144.249:10082/feedAtom/a8c4ff0ea84de9865ac088d703c07eb2"/>
     </body>
 </opml>
