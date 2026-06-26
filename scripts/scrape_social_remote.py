@@ -49,6 +49,8 @@ import feedparser
 import requests
 from bs4 import BeautifulSoup
 
+import img_relay
+
 USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
@@ -303,9 +305,24 @@ def main() -> int:
         print("No new social posts in window.")
         return 0
 
-    # 图片不在海外侧下载回传了（pbs.twimg.com 常封机房 IP、b64 还会把 POST 撑爆）。
-    # 只把原始图片地址（images 字段）带回，由国内服务端经 images.weserv.nl 公共代理
-    # 自取并本地缓存（实测国内可达）。这里无需再做任何图片下载。
+    # 海外侧下载社媒配图字节、base64 回传：国内服务器对 truthsocial CDN 直连超时、
+    # weserv 回源也常 404（国内手机能直连但部分用户不行），唯一稳妥是由海外这侧（可直连
+    # 推特/Truth）下载好字节带回，国内落盘并本地直供 /relay-img，全员可见。
+    # X 图：先试 nitter /pic 直连，再退 pbs.twimg.com，最后 weserv 兜底；Truth：直连失败走 weserv。
+    n_img = 0
+    for p in fresh:
+        imgs = p.get("images") or []
+        if not imgs:
+            continue
+        src = imgs[0]
+        cands = [src, img_relay.nitter_to_twimg(src)] if p.get("platform") == "x" else [src]
+        b64, mime = img_relay.download_best(cands, referer=p.get("url"))
+        if b64:
+            p["image_b64"] = b64
+            p["image_mime"] = mime
+            n_img += 1
+    print(f"[img] relayed {n_img}/{len(fresh)} post images")
+
     print(f"POST {len(fresh)} posts -> {social_url}")
     resp = requests.post(
         social_url,
