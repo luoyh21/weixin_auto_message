@@ -169,6 +169,49 @@ def summarize_paper(title: str, raw_text: str = "", hint: str = "") -> str:
     return resp.choices[0].message.content.strip()
 
 
+SYS_TRANSLATE = (
+    "你是航天领域的中文编辑。用户会给你一条英文航天资讯（标题 + 正文）。\n"
+    "请翻译并精炼成简体中文，只输出一个 JSON 对象，不要任何额外文字、不要 markdown：\n"
+    "{\n"
+    '  "title": "不超过30字的简体中文标题（必填，忠实原意，不照抄英文）",\n'
+    '  "summary": "用简体中文把正文概括成2~4句（约120字以内），保留关键数字/机构/技术名词；正文为空则据标题给一句话简介"\n'
+    "}\n"
+    "术语用航天业界通行中文译名；个别专有缩写可中英并存。不要寒暄、不要逐句直译堆砌。"
+)
+
+
+def translate_zh(title: str, text: str = "") -> dict:
+    """把英文航天资讯翻成中文，返回 {"title": 中文标题, "summary": 中文摘要}。
+
+    失败时回退英文原文（title 原样、summary 取正文/标题截断），保证调用方仍可入库。
+    """
+    import json as _json
+
+    title = (title or "").strip()
+    text = (text or "").strip()
+    if not title and not text:
+        return {"title": "", "summary": ""}
+    user = f"标题：{title}\n\n正文：\n{text[:3000]}"
+    try:
+        resp = client().chat.completions.create(
+            model=SETTINGS.openai_model,
+            messages=[
+                {"role": "system", "content": SYS_TRANSLATE},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        data = _json.loads(resp.choices[0].message.content.strip())
+        zh_title = (data.get("title") or "").strip()
+        zh_summary = (data.get("summary") or "").strip()
+        if zh_title or zh_summary:
+            return {"title": zh_title or title, "summary": zh_summary or text[:140]}
+    except Exception as e:
+        log.warning("translate_zh failed: %s", e)
+    return {"title": title, "summary": (text or title)[:140]}
+
+
 SYS_SOCIAL = (
     "你是航天领域的情报分析编辑。用户会给你一条政要（如马斯克、特朗普）在社交媒体（X / Truth Social）"
     "上的帖子原文（英文为主）。\n"

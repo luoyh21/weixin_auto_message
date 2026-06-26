@@ -52,6 +52,28 @@ def sync_gzh_store():
     except Exception as e:
         logging.exception("gzh_store sync failed: %s", e)
 
+
+def sync_space_feeds():
+    """每日刷新三新栏目：技术港(TechPort) / 每日发射(LL2) / 碎片更新(CelesTrak)。
+
+    三者各自 try 包裹、互不影响；失败只记日志，不阻断其余。
+    """
+    try:
+        from src.techport_store import refresh as _tp_refresh  # noqa: E402
+        logging.info("techport_store sync: +%d", _tp_refresh())
+    except Exception as e:
+        logging.exception("techport_store sync failed: %s", e)
+    try:
+        from src.launch_store import refresh as _ls_refresh  # noqa: E402
+        logging.info("launch_store sync: +%d", _ls_refresh())
+    except Exception as e:
+        logging.exception("launch_store sync failed: %s", e)
+    try:
+        from src.debris_store import refresh as _ds_refresh  # noqa: E402
+        logging.info("debris_store sync: +%d", _ds_refresh())
+    except Exception as e:
+        logging.exception("debris_store sync failed: %s", e)
+
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -205,6 +227,14 @@ def main():
         id="gzh_store_sync", misfire_grace_time=1800,
     )
     enabled.append("公众号库同步 每6小时")
+
+    # 每天 04:10 刷新三新栏目（技术港 / 每日发射 / 碎片更新），各自直连抓取一次
+    sched.add_job(
+        sync_space_feeds,
+        trigger=CronTrigger(hour=4, minute=10, timezone=SETTINGS.daily_tz),
+        id="space_feeds_sync", misfire_grace_time=3600,
+    )
+    enabled.append("三新栏目同步 每日04:10")
 
     # 每天 03:30 把「微信插件」二维码按 .env 配置同步一次（静态来源，便宜）
     sched.add_job(
