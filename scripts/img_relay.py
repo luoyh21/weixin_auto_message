@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import re
 import sys
+import time
 from urllib.parse import quote, unquote
 
 import requests
@@ -67,23 +68,40 @@ def nitter_to_twimg(url: str) -> str:
     return "https://pbs.twimg.com/" + path
 
 
+def _default_referer(url: str) -> str:
+    """没有显式 referer 时，按图源 host 给一个合理的 Referer。
+    truthsocial 的 static-assets CDN 对带本站 Referer 的请求更友好。"""
+    h = _host(url)
+    if "truthsocial" in h:
+        return "https://truthsocial.com/"
+    if "twimg" in h:
+        return "https://twitter.com/"
+    return ""
+
+
 def download_as_b64(url: str, referer: str | None = None) -> tuple[str, str] | tuple[None, None]:
-    """下载图片，返回 (base64字符串, mime)。失败返回 (None, None)。"""
+    """下载图片，返回 (base64字符串, mime)。失败返回 (None, None)。带 2 次重试。"""
     if not url or not url.startswith(("http://", "https://")):
         return None, None
     headers = {
         "User-Agent": _UA,
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
     }
-    if referer:
-        headers["Referer"] = referer
-    try:
-        r = requests.get(url, headers=headers, timeout=25)
-        if r.status_code != 200 or not r.content:
-            print(f"  [relay] {url} -> HTTP {r.status_code}", file=sys.stderr)
-            return None, None
-    except Exception as e:
-        print(f"  [relay] {url} -> {e}", file=sys.stderr)
+    ref = referer or _default_referer(url)
+    if ref:
+        headers["Referer"] = ref
+    r = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=headers, timeout=25)
+            if r.status_code == 200 and r.content:
+                break
+            print(f"  [relay] {url} -> HTTP {r.status_code} (try {attempt + 1})", file=sys.stderr)
+        except Exception as e:
+            print(f"  [relay] {url} -> {e} (try {attempt + 1})", file=sys.stderr)
+            r = None
+        time.sleep(1.0 * (attempt + 1))
+    if r is None or r.status_code != 200 or not r.content:
         return None, None
     data = r.content
     if len(data) > MAX_BYTES:

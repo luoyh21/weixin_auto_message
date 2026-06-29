@@ -89,10 +89,9 @@ def _download_via_weserv(src_url: str) -> tuple[bytes, str] | None:
     return r.content, ct
 
 
-# 这些源站：国内服务器 / weserv 都取不到，但**用户手机能直连**（实测 truthsocial 的
-# static-assets CDN 在国内消费级网络可直接加载，而微信 <image> 不需要域名白名单）。
-# 对这类源，服务端中继失败时回退「直接存原始地址、让手机自行加载」。
-_PHONE_DIRECT_HOSTS = ("truthsocial.com",)
+# 注意：实测 truthsocial / pbs.twimg 在国内消费级网络**也加载不出来**（域名被墙），
+# 所以中继失败时绝不能回退存原始地址——那样手机只会显示空白/破图。中继不到就留空、不配图。
+_PHONE_DIRECT_HOSTS: tuple[str, ...] = ()
 
 
 def _phone_loadable(url: str) -> bool:
@@ -263,8 +262,43 @@ def ingest_and_enrich(posts: list[dict]) -> int:
             store.update(enriched)
             _prune(store)
             _save(store)
-    log.info("social ingest: %d posts in, %d stored", len(posts), added)
+
+    # 回填：对**已入库但配图还不是本地 /relay-img**（旧的失效原址或空）的帖子，
+    # 若本批重新带回了可用图（image_b64 / 可下载源），就地把 image 换成本地图；
+    # 仍取不到则清成空串，避免手机端继续显示空白/破图。不重复调用 LLM。
+    refreshed = _backfill_images(posts)
+
+    log.info("social ingest: %d posts in, %d stored, %d images refreshed",
+             len(posts), added, refreshed)
     return added
+
+
+def _backfill_images(posts: list[dict]) -> int:
+    with _LOCK:
+        store = _load()
+        existing = {k: store[k].get("image", "") or "" for k in store}
+    updates: dict[str, str] = {}
+    for p in posts:
+        k = _key(p)
+        if k not in existing:
+            continue
+        cur = existing[k]
+        if "/relay-img/" in cur:
+            continue  # 已是本地图，跳过
+        new_img = _resolve_image(p)
+        if new_img and new_img != cur:
+            updates[k] = new_img
+        elif cur and not new_img:
+            updates[k] = ""  # 原址不可达且这次也没取到 → 清空，别再显示破图
+    if not updates:
+        return 0
+    with _LOCK:
+        store = _load()
+        for k, v in updates.items():
+            if k in store:
+                store[k]["image"] = v
+        _save(store)
+    return len(updates)
 
 
 def load_recent(days: int = 9) -> list[dict]:
