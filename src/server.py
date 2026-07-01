@@ -11,8 +11,6 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import hashlib
-import requests
 from fastapi import FastAPI, Request, Response, HTTPException, Header
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -76,48 +74,20 @@ def root():
     }
 
 
-_IMG_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
-
-
 @app.get("/img")
-def img_proxy(u: str, r: str = ""):
-    """图片代理：?u=源图URL&r=Referer。第一次同步抓取源图、落盘缓存、返回；
-    后续同 (u,r) 命中缓存直接返回，企业微信卡片里的 picurl 接收方都从这里拉。"""
+def img_proxy(u: str, r: str = "", w: int = 0, q: int = 0):
+    """图片代理：?u=源图URL&r=Referer&w=缩略宽&q=JPEG质量。第一次同步抓取（直连→weserv 兜底）、
+    可选等比缩略、落盘缓存后返回；后续同 (u,r,w,q) 命中缓存直接秒回。
+
+    列表缩略图带 w（如 300）→ 体积降到原图 ~1/10，弱网/隧道下首屏图片显著更快；
+    详情大图不带 w → 复用原图缓存、清晰度不受影响。"""
     if not (u.startswith("http://") or u.startswith("https://")):
         raise HTTPException(status_code=400, detail="bad url")
-    key = hashlib.sha256(f"{u}|{r}".encode("utf-8")).hexdigest()[:40]
-    bin_path = IMG_CACHE_DIR / f"{key}.bin"
-    ct_path = IMG_CACHE_DIR / f"{key}.ct"
-    if bin_path.exists() and ct_path.exists():
-        return Response(
-            content=bin_path.read_bytes(),
-            media_type=ct_path.read_text(encoding="utf-8").strip() or "image/jpeg",
-            headers={"Cache-Control": "public, max-age=86400"},
-        )
-    headers = {
-        "User-Agent": _IMG_UA,
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    }
-    if r:
-        headers["Referer"] = r
-    try:
-        resp = requests.get(u, headers=headers, timeout=15)
-        resp.raise_for_status()
-    except Exception as e:
-        log.warning("img_proxy upstream fail u=%s err=%s", u, e)
-        raise HTTPException(status_code=502, detail=f"upstream: {e}")
-    data = resp.content
-    if len(data) > 20 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="image too large")
-    ct = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
-    if not ct.startswith("image/"):
-        ct = "image/jpeg"
-    bin_path.write_bytes(data)
-    ct_path.write_text(ct, encoding="utf-8")
+    from .img_proxy import get_or_fetch  # noqa: E402
+    got = get_or_fetch(u, r, w, q, timeout=15.0)
+    if got is None:
+        raise HTTPException(status_code=502, detail="upstream fetch failed")
+    data, ct = got
     return Response(
         content=data,
         media_type=ct,

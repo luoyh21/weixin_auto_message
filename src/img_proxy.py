@@ -39,8 +39,12 @@ def public_base() -> str:
     return f"http://{host}:{SETTINGS.server_port}"
 
 
-def proxify(image_url: str, referer: str | None = None) -> str:
-    """把任意第三方图片 URL 包装成本机 /img?u=... 代理 URL。空输入原样返回。"""
+def proxify(image_url: str, referer: str | None = None,
+            width: int = 0, quality: int = 0) -> str:
+    """把任意第三方图片 URL 包装成本机 /img?u=... 代理 URL。空输入原样返回。
+
+    width>0 时附带 &w= 让服务端返回等比缩略图（列表卡片用，省流量），quality 控 JPEG 质量。
+    """
     if not image_url:
         return ""
     if image_url.startswith(public_base()):
@@ -48,11 +52,17 @@ def proxify(image_url: str, referer: str | None = None) -> str:
     qs = {"u": image_url}
     if referer:
         qs["r"] = referer
+    if width and width > 0:
+        qs["w"] = str(width)
+    if quality and quality > 0:
+        qs["q"] = str(quality)
     return f"{public_base()}/img?{urlencode(qs)}"
 
 
-def _cache_key(u: str, r: str) -> str:
-    return hashlib.sha256(f"{u}|{r}".encode("utf-8")).hexdigest()[:40]
+def _cache_key(u: str, r: str, w: int = 0, q: int = 0) -> str:
+    # w==0 且 q==0 时保持与历史一致（原图缓存复用）；带缩放参数则独立成变体缓存
+    raw = f"{u}|{r}" if not (w or q) else f"{u}|{r}|w{w}q{q}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:40]
 
 
 def cached_bytes(image_url: str, referer: str | None = None) -> bytes | None:
@@ -89,21 +99,56 @@ def _try_fetch(url: str, headers: dict, timeout: float):
     return resp, ""
 
 
-def prefetch(image_url: str, referer: str | None = None, *, timeout: float = 12.0) -> bool:
-    """主动预热代理缓存。成功（200 + image/*）返回 True，失败 False。
+def _resize(data: bytes, width: int, quality: int) -> tuple[bytes, str] | None:
+    """把图片等比缩到最大宽 width、转 JPEG（quality）。失败或无需缩放返回 None。
 
-    流程：
-    1. 直接抓源图（带 Referer/UA）
-    2. 失败时降级用 images.weserv.nl 公共图片代理重试
+    仅在原图确实更宽时才缩放，避免把小图放大、也避免无谓重编码。
     """
-    if not image_url:
-        return False
-    r = referer or ""
-    key = _cache_key(image_url, r)
+    if width <= 0:
+        return None
+    try:
+        import io
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        if im.width <= width:
+            return None  # 原图不比目标宽，不缩放（保持原字节由调用方处理）
+        h = max(1, round(im.height * width / im.width))
+        im = im.resize((width, h), Image.LANCZOS)
+        if im.mode in ("RGBA", "LA", "P"):
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            im = im.convert("RGBA")
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=quality or 75, optimize=True)
+        return out.getvalue(), "image/jpeg"
+    except Exception as e:
+        log.warning("img resize failed (w=%s): %s", width, e)
+        return None
+
+
+def get_or_fetch(u: str, r: str = "", width: int = 0, quality: int = 0,
+                 *, timeout: float = 12.0) -> tuple[bytes, str] | None:
+    """取图片字节：命中缓存直接返回；否则抓源图（直连→weserv 兜底）→ 可选缩略 → 落盘。
+
+    返回 (data, content_type) 或 None（彻底失败）。/img 端点与 prefetch 共用此核心，
+    保证「手机按需请求」和「后台预热」用同一套键与同一套缩放策略。
+    """
+    if not u:
+        return None
+    key = _cache_key(u, r, width, quality)
     bin_path = IMG_CACHE_DIR / f"{key}.bin"
     ct_path = IMG_CACHE_DIR / f"{key}.ct"
     if bin_path.exists() and ct_path.exists() and bin_path.stat().st_size > 0:
-        return True
+        try:
+            return bin_path.read_bytes(), (ct_path.read_text(encoding="utf-8").strip() or "image/jpeg")
+        except Exception:
+            pass
+
     headers = {
         "User-Agent": _UA,
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -112,23 +157,40 @@ def prefetch(image_url: str, referer: str | None = None, *, timeout: float = 12.
     if r:
         headers["Referer"] = r
 
-    resp, err = _try_fetch(image_url, headers, timeout)
+    resp, err = _try_fetch(u, headers, timeout)
     if resp is None:
         # 降级：用 weserv.nl 公共图片代理重试（NSF / Cloudflare 之类强盗链通常能拿到）
-        log.info("img direct fail %s (%s), retry via weserv", image_url, err)
-        ws = _weserv_url(image_url)
+        log.info("img direct fail %s (%s), retry via weserv", u, err)
+        ws = _weserv_url(u)
         ws_headers = {k: v for k, v in headers.items() if k != "Referer"}
         resp, err = _try_fetch(ws, ws_headers, timeout)
         if resp is None:
-            log.info("img weserv fallback also failed %s: %s", image_url, err)
-            return False
+            log.info("img weserv fallback also failed %s: %s", u, err)
+            return None
 
     data = resp.content
     if not data or len(data) > 20 * 1024 * 1024:
-        return False
+        return None
     ct = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip().lower()
     if not ct.startswith("image/"):
         ct = "image/jpeg"
-    bin_path.write_bytes(data)
-    ct_path.write_text(ct, encoding="utf-8")
-    return True
+
+    if width and width > 0:
+        resized = _resize(data, width, quality)
+        if resized is not None:
+            data, ct = resized
+
+    try:
+        bin_path.write_bytes(data)
+        ct_path.write_text(ct, encoding="utf-8")
+    except Exception as e:
+        log.warning("img cache write failed: %s", e)
+    return data, ct
+
+
+def prefetch(image_url: str, referer: str | None = None, *,
+             width: int = 0, quality: int = 0, timeout: float = 12.0) -> bool:
+    """主动预热代理缓存。成功（拿到 image/* 字节）返回 True，失败 False。"""
+    if not image_url:
+        return False
+    return get_or_fetch(image_url, referer or "", width, quality, timeout=timeout) is not None
