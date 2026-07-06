@@ -69,6 +69,11 @@ def sync_space_feeds():
     except Exception as e:
         logging.exception("launch_store sync failed: %s", e)
     try:
+        from src.launch_store import refresh_upcoming as _lu_refresh  # noqa: E402
+        logging.info("launch_upcoming sync: %d", _lu_refresh())
+    except Exception as e:
+        logging.exception("launch_upcoming sync failed: %s", e)
+    try:
         from src.debris_store import refresh as _ds_refresh  # noqa: E402
         logging.info("debris_store sync: +%d", _ds_refresh())
     except Exception as e:

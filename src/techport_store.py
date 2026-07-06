@@ -38,6 +38,72 @@ _UA = (
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
 
+# NASA 2020 技术分类（TX 一级）代码 -> 中文
+_TX_ZH: dict[str, str] = {
+    "TX01": "推进系统",
+    "TX02": "飞行计算与航电",
+    "TX03": "航天电源与储能",
+    "TX04": "机器人系统",
+    "TX05": "通信、导航与轨道碎片跟踪",
+    "TX06": "人体健康、生命保障与居住系统",
+    "TX07": "探索目的地系统",
+    "TX08": "传感器与科学仪器",
+    "TX09": "进入、下降与着陆(EDL)",
+    "TX10": "自主系统",
+    "TX11": "软件、建模仿真与信息处理",
+    "TX12": "材料、结构、机械与制造",
+    "TX13": "地面、测试与地表系统",
+    "TX14": "热管理系统",
+    "TX15": "飞行器系统",
+    "TX16": "空管与靶场跟踪系统",
+    "TX17": "制导、导航与控制(GN&C)",
+}
+
+# 项目状态英文 -> 中文
+_STATUS_ZH: dict[str, str] = {
+    "Active": "进行中",
+    "Completed": "已完成",
+    "Canceled": "已取消",
+    "Cancelled": "已取消",
+    "Not Started": "未开始",
+    "On Hold": "已暂停",
+}
+
+_MONTH_NUM = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _fmt_date(date_str: str, year, month) -> str:
+    """把 TechPort 的起止时间规整成「YYYY年M月」；缺失则退回原串。"""
+    try:
+        y = int(year) if year else 0
+        m = int(month) if month else 0
+        if y and m:
+            return f"{y}年{m}月"
+        if y:
+            return f"{y}年"
+    except Exception:
+        pass
+    s = (date_str or "").strip()
+    # 兜底解析 "Mar 2026"
+    parts = s.split()
+    if len(parts) == 2 and parts[0][:3].lower() in _MONTH_NUM:
+        return f"{parts[1]}年{_MONTH_NUM[parts[0][:3].lower()]}月"
+    return s
+
+
+def _tx_category(detail: dict) -> tuple[str, str]:
+    """返回 (技术类别中文, 类别代码)。取 primaryTx（一级取根）。"""
+    tx = detail.get("primaryTx") or {}
+    code = (tx.get("code") or "").strip()
+    root = code[:4] if code else ""
+    zh = _TX_ZH.get(root, "")
+    if not zh and tx.get("title"):
+        zh = tx.get("title")  # 未收录的代码退回英文标题
+    return zh, code
+
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -148,12 +214,23 @@ def refresh() -> int:
             zh = translate_zh(title_en, desc_en)
             upd_raw = str(detail.get("lastUpdated") or upd)
             dt = _parse_updated(upd_raw) or _now_utc()
+            status_en = (detail.get("status") or "").strip()
+            cat_zh, cat_code = _tx_category(detail)
             store[str(pid)] = {
                 "project_id": pid,
                 "title": zh.get("title") or title_en,
                 "title_en": title_en,
                 "summary": zh.get("summary") or desc_en[:140],
-                "status": (detail.get("status") or "").strip(),
+                "status": status_en,
+                "status_zh": _STATUS_ZH.get(status_en, status_en),
+                "start_date": _fmt_date(detail.get("startDateString"), detail.get("startYear"), detail.get("startMonth")),
+                "end_date": _fmt_date(detail.get("endDateString"), detail.get("endYear"), detail.get("endMonth")),
+                "trl_begin": detail.get("trlBegin"),
+                "trl_end": detail.get("trlEnd"),
+                "category": cat_zh,
+                "category_code": cat_code,
+                "program": ((detail.get("program") or {}).get("acronym")
+                            or (detail.get("program") or {}).get("title") or "").strip(),
                 "link": _VIEW_URL.format(pid=pid),
                 "published": dt.isoformat(),
                 "updated_raw": upd_raw,
@@ -161,10 +238,34 @@ def refresh() -> int:
             }
             added += 1
 
+        # 回填：历史条目缺结构化字段（起止/TRL/类别/计划）时补抓一次详情（不再调 LLM），每轮封顶。
+        backfilled = 0
+        for key, v in store.items():
+            if backfilled >= 15:
+                break
+            if "trl_begin" in v and "category" in v:
+                continue
+            detail = _fetch_detail(v.get("project_id"))
+            if not detail:
+                continue
+            status_en = (detail.get("status") or v.get("status") or "").strip()
+            cat_zh, cat_code = _tx_category(detail)
+            v["status"] = status_en
+            v["status_zh"] = _STATUS_ZH.get(status_en, status_en)
+            v["start_date"] = _fmt_date(detail.get("startDateString"), detail.get("startYear"), detail.get("startMonth"))
+            v["end_date"] = _fmt_date(detail.get("endDateString"), detail.get("endYear"), detail.get("endMonth"))
+            v["trl_begin"] = detail.get("trlBegin")
+            v["trl_end"] = detail.get("trlEnd")
+            v["category"] = cat_zh
+            v["category_code"] = cat_code
+            v["program"] = ((detail.get("program") or {}).get("acronym")
+                            or (detail.get("program") or {}).get("title") or "").strip()
+            backfilled += 1
+
         _prune(store)
         _save(store)
-        if added:
-            log.info("techport_store: +%d (total=%d)", added, len(store))
+        if added or backfilled:
+            log.info("techport_store: +%d, backfill %d (total=%d)", added, backfilled, len(store))
         return added
 
 
@@ -182,6 +283,14 @@ def load_recent(days: int = 14) -> list[dict]:
             "title_en": v.get("title_en") or "",
             "summary": v.get("summary") or "",
             "status": v.get("status") or "",
+            "status_zh": v.get("status_zh") or v.get("status") or "",
+            "start_date": v.get("start_date") or "",
+            "end_date": v.get("end_date") or "",
+            "trl_begin": v.get("trl_begin"),
+            "trl_end": v.get("trl_end"),
+            "category": v.get("category") or "",
+            "category_code": v.get("category_code") or "",
+            "program": v.get("program") or "",
             "link": v.get("link") or "",
             "published": v.get("published") or "",
         })
