@@ -21,6 +21,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import news_archive
+
 log = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +79,8 @@ def add(entries: list[dict]) -> int:
     """
     if not entries:
         return 0
+    # 先永久归档原始抓取结果；即便短期展示库随后按 14 天轮转，记录仍可供后续使用。
+    news_archive.append("gzh", entries)
     with _LOCK:
         store = _load()
         added = 0

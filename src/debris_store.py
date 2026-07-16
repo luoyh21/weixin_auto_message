@@ -17,6 +17,8 @@ from pathlib import Path
 
 import requests
 
+from . import news_archive
+
 log = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -160,6 +162,8 @@ def refresh() -> int:
                 "published": today_bj.isoformat(timespec="seconds"),
             }
 
+        # 每日汇总（含 NORAD 编号明细）永久归档，短期展示库之后仍按窗口轮转。
+        news_archive.append("debris", [store[date_key]])
         _prune(store)
         _save(store)
         seen |= set(str(x.get("NORAD_CAT_ID")) for x in new)

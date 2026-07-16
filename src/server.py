@@ -54,6 +54,13 @@ try:
         threading.Thread(target=_news_store.warm, daemon=True).start()
     except Exception as _we:  # noqa
         logging.getLogger(__name__).warning("news cache warm skip: %s", _we)
+
+    # 全量搜索索引（含历史归档回补）同样后台预热，避免第一次搜索现场扫全部归档文件。
+    try:
+        from weixin_miniprogram.backend import search_store as _search_store  # noqa: E402
+        threading.Thread(target=_search_store.warm, daemon=True).start()
+    except Exception as _se:  # noqa
+        logging.getLogger(__name__).warning("search index warm skip: %s", _se)
 except Exception as _e:  # noqa
     logging.getLogger(__name__).warning("mini-program backend not mounted: %s", _e)
 

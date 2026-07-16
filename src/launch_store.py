@@ -17,7 +17,7 @@ from pathlib import Path
 
 import requests
 
-from . import space_i18n
+from . import news_archive, space_i18n
 
 log = logging.getLogger(__name__)
 
@@ -195,6 +195,8 @@ def refresh() -> int:
                     cur["location_zh"] = space_i18n.place_zh(
                         location or cur.get("location") or pad_name or cur.get("pad", ""))
 
+        # 当前短期库中的发射记录同时写入永久归档；归档去重不会重复追加。
+        news_archive.append("launch", list(store.values()))
         _prune(store)
         _save(store)
         if added:
@@ -291,6 +293,12 @@ def refresh_upcoming() -> int:
         tmp = _UPCOMING_STORE.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(_UPCOMING_STORE)
+    # 未来计划会不断调整，按抓取批次保存快照，供日后回溯排期变化。
+    news_archive.append("launch_upcoming", [{
+        "generated_at": payload["generated_at"],
+        "days": payload["days"],
+        "launches": items,
+    }])
     log.info("launch_upcoming: %d launches in next %dd", len(items), UPCOMING_DAYS)
     return len(items)
 

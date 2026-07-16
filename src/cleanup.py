@@ -11,13 +11,17 @@
 不动的目录：
     data/join                     扫码引导页所需 PNG/JSON
     data/zlzchat.opml             订阅源
+    data/news_archive             永久新闻归档（不展示、不清理）
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import time
 from pathlib import Path
+
+from . import news_archive
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +47,33 @@ def _prune_files(folder: Path, *, patterns: tuple[str, ...], days: int) -> int:
     return removed
 
 
+def _archive_then_prune(folder: Path, *, kind: str, days: int) -> int:
+    """把过期 JSON 新闻批次转入永久归档，成功后才删除短期副本。"""
+    if not folder.exists():
+        return 0
+    cutoff = time.time() - days * 86400
+    moved = 0
+    for p in folder.glob("*.json"):
+        try:
+            if not p.is_file() or p.stat().st_mtime >= cutoff:
+                continue
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            written = news_archive.append(kind, [{
+                "source_file": p.name,
+                "source_mtime": p.stat().st_mtime,
+                "payload": raw,
+            }])
+            # 若此前已归档，append 会返回 0，也可安全删除短期重复副本。
+            p.unlink()
+            moved += 1
+            if written:
+                log.info("cleanup: archived %s -> news_archive", p.name)
+        except Exception as e:
+            # 归档失败时保留原文件，宁可占空间也不丢新闻。
+            log.warning("archive before cleanup failed %s: %s", p, e)
+    return moved
+
+
 def _prune_subdirs(folder: Path, *, days: int) -> int:
     """对 news_pages/<batch>/ 这类按子目录组织的内容，按子目录 mtime 整体清理。"""
     if not folder.exists():
@@ -66,8 +97,9 @@ def _prune_subdirs(folder: Path, *, days: int) -> int:
 def run(days: int = 14) -> dict:
     """主入口：清理所有受管目录，返回每个目录删除计数。"""
     stats = {
-        "ingest":          _prune_files(DATA / "ingest",          patterns=("*.json",),       days=days),
-        "cache":           _prune_files(DATA / "cache",           patterns=("*.json",),       days=days),
+        # 新闻原始批/每日汇总不直接删除：先转存到独立永久归档目录。
+        "ingest":          _archive_then_prune(DATA / "ingest", kind="ingest", days=days),
+        "cache":           _archive_then_prune(DATA / "cache", kind="cache", days=days),
         "translate_cache": _prune_files(DATA / "translate_cache", patterns=("*.txt",),        days=days),
         "img_cache":       _prune_files(DATA / "img_cache",       patterns=("*.bin", "*.ct"), days=days),
         "dy_pages":        _prune_files(DATA / "dy_pages",        patterns=("*.html",),       days=days),

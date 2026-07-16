@@ -21,6 +21,8 @@ import requests
 
 from pathlib import Path
 
+from . import news_archive
+
 log = logging.getLogger(__name__)
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -262,6 +264,12 @@ def refresh() -> int:
                             or (detail.get("program") or {}).get("title") or "").strip()
             backfilled += 1
 
+        # 归档完整的结构化项目记录；此目录不参与小程序列表与日常清理。
+        if todo:
+            news_archive.append(
+                "techport",
+                [store[str(pid)] for pid, _ in todo if str(pid) in store],
+            )
         _prune(store)
         _save(store)
         if added or backfilled:

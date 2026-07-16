@@ -21,6 +21,8 @@ from urllib.parse import quote, unquote
 
 import requests
 
+from . import news_archive
+
 log = logging.getLogger(__name__)
 
 _WORD_RE = re.compile(r"\S+")
@@ -257,6 +259,8 @@ def ingest_and_enrich(posts: list[dict]) -> int:
         added += 1
 
     if enriched:
+        # 永久保存富化后的原文、翻译与解读；短期展示库依旧按窗口轮转。
+        news_archive.append("social", list(enriched.values()))
         with _LOCK:
             store = _load()
             store.update(enriched)

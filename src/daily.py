@@ -25,6 +25,7 @@ from . import tagging, dedup
 from .img_proxy import proxify as proxy_img, prefetch as prefetch_img, cached_bytes as cached_img_bytes
 from .dy_pages import render_landing as render_dy_landing
 from . import wx_mp
+from . import news_archive
 
 log = logging.getLogger(__name__)
 
@@ -561,6 +562,9 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
     except Exception as e:
         log.exception("fetch NASA/ESA failed: %s", e)
 
+    # 永久归档原始抓取结果（在推送去重之前）；归档不参与日常展示或 cleanup。
+    news_archive.append("intl", sn)
+
     # 公众号订阅按"早间一次性覆盖昨天到今天 24h"的策略：
     # - 早间速递：固定取过去 24 小时（覆盖前一天 8:00 至当天 8:00 这段所有更新）
     # - 晚间速递：完全不发公众号（避免一日内重复且打扰）
@@ -575,6 +579,7 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
         opml_hours = hrs
     if opml_hours > 0:
         opml = [e.to_dict() for e in fetch_opml_recent(hours=opml_hours)]
+        news_archive.append("gzh", opml)
         # 抓到即入独立公众号库（dedup 之前），保证每条更新都能进小程序，
         # 不受「推送去重」或「当次是否被选入摘要」影响。
         try:
@@ -665,6 +670,7 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
         douyin_items = [x["_obj"] for x in _dy_tmp]
 
     douyin_dicts = [d.to_dict() for d in douyin_items]
+    news_archive.append("douyin", douyin_dicts)
 
     date_str = _today_str()
     if not sn:
@@ -938,6 +944,13 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
 
     p = cache_path(date_str, session_key)
     p.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 永久保留最终的推送/翻译结果；短期 cache 文件仍可由 cleanup 轮转。
+    news_archive.append("digest", [{
+        "cache_file": p.name,
+        "session": session_key,
+        "generated_at": record.get("generated_at", ""),
+        "record": record,
+    }])
     log.info("Cached -> %s", p)
     log.info("=== %s run done (sent=%s) ===", session_label, record["sent"])
     return record
