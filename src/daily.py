@@ -174,6 +174,7 @@ def _build_mpnews_content_sn(
     inline_img_url: str,
     original_link: str,
     tags: list[str] | None = None,
+    summary_zh: str = "",
 ) -> tuple[str, str]:
     """SpaceNews 文章 → mpnews 正文 HTML + digest。"""
     import html as _h
@@ -188,6 +189,15 @@ def _build_mpnews_content_sn(
         pieces.append(
             f'<p><img src="{_h.escape(inline_img_url)}" style="max-width:100%;height:auto;"/></p>'
         )
+    blurb = (summary_zh or "").strip()
+    if blurb:
+        pieces.append(
+            '<div style="background:#f5f8ff;border:1px solid #e6eeff;border-radius:8px;'
+            'padding:12px 14px;margin:0 0 16px;">'
+            '<p style="color:#1664ff;font-size:13px;font-weight:600;margin:0 0 6px;">内容概要</p>'
+            f'<p style="font-size:15px;line-height:1.75;color:#2a3344;margin:0;">'
+            f'{_h.escape(blurb)}</p></div>'
+        )
     if body_zh:
         pieces.append(f'<div style="font-size:16px;line-height:1.75;">{_para_html(body_zh)}</div>')
     else:
@@ -198,7 +208,7 @@ def _build_mpnews_content_sn(
             f'原文链接：{_h.escape(original_link)}</p>'
         )
     content = "\n".join(pieces)
-    digest = (body_zh or title_zh or "").strip().replace("\n", " ")[:120]
+    digest = (blurb or body_zh or title_zh or "").strip().replace("\n", " ")[:120]
     return content, digest
 
 
@@ -618,6 +628,8 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                     a["title_zh"] = pr.title_zh
                 if pr.body_zh:
                     a["body_zh"] = pr.body_zh
+                if pr.summary_zh:
+                    a["summary_zh"] = pr.summary_zh
                 if pr.tags:
                     a["tags"] = pr.tags
     hero_article, hero_candidates = _pick_hero(sn)
@@ -749,6 +761,7 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                         inline_img_url=inline_url or "",
                         original_link=a.get("original_link") or "",
                         tags=tags,  # 正文开头放全部标签
+                        summary_zh=a.get("summary_zh") or "",
                     )
                     mp_art = {
                         "title": titled[:120],

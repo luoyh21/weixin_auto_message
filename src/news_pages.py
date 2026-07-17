@@ -30,7 +30,7 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
 from .config import SETTINGS
-from .summarizer import client as openai_client
+from .summarizer import client as openai_client, summarize_zh
 from . import tagging
 
 log = logging.getLogger(__name__)
@@ -280,6 +280,10 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 .tags span {{ display: inline-block; background: #eef2ff; color: #1664ff; font-size: 13px;
               padding: 2px 10px; border-radius: 12px; margin: 0 6px 6px 0; }}
 .hero {{ width: 100%; border-radius: 8px; margin: 12px 0 20px; }}
+.blurb {{ background: #f5f8ff; border: 1px solid #e6eeff; border-radius: 8px;
+          padding: 14px 16px; margin: 0 0 22px; }}
+.blurb .label {{ font-size: 13px; color: #1664ff; font-weight: 600; margin: 0 0 8px; }}
+.blurb .txt {{ font-size: 15px; line-height: 1.75; color: #2a3344; margin: 0; text-indent: 0; }}
 .body p {{ margin: 0 0 18px; font-size: 16px; text-indent: 2em; line-height: 1.9; }}
 .body img {{ max-width: 100%; height: auto; border-radius: 6px; margin: 14px 0; }}
 .footer {{ margin-top: 32px; padding-top: 16px; border-top: 1px solid #eee;
@@ -292,6 +296,7 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 <div class="meta">来源：{source} · {published}</div>
 {tags_html}
 {hero_html}
+{summary_html}
 <div class="body">
 {body_html}
 </div>
@@ -393,6 +398,19 @@ def _rotate(batch_id: str, ids_in_batch: list[str]) -> None:
 
 # ---------- 主流程 ----------
 
+def _summary_html(summary_zh: str) -> str:
+    """正文前的「内容概要」块（仅国际要闻翻译页）。"""
+    s = (summary_zh or "").strip()
+    if not s:
+        return ""
+    return (
+        '<div class="blurb">'
+        '<div class="label">内容概要</div>'
+        f'<p class="txt">{html.escape(s)}</p>'
+        "</div>"
+    )
+
+
 @dataclass
 class PageResult:
     orig_url: str
@@ -401,6 +419,7 @@ class PageResult:
     image_url: str  # 选定的主图（绝对 URL）
     title_zh: str = ""   # 中文标题（若翻译失败 = 原文标题）
     body_zh: str = ""    # 中文正文（纯文本，按段落用 \n\n 分隔；翻译失败为空）
+    summary_zh: str = ""  # 正文前的短概要（2~4 句）
     tags: list = field(default_factory=list)  # 主题标签 + 范围标签
 
 
@@ -491,6 +510,14 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
 
         zh_text = _strip_author_bio(zh_text)
 
+        # 内容概要：有中文正文时再生成；失败则跳过（页面仍可展示全文）
+        summary_zh = ""
+        if zh_text:
+            try:
+                summary_zh = summarize_zh(title_zh, zh_text)
+            except Exception as e:
+                log.warning("summarize_zh failed for %s: %s", item.get("link"), e)
+
         if zh_text:
             body_html = _para_to_html(zh_text)
         else:
@@ -540,6 +567,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             published=html.escape(to_beijing(item.get("published", ""))),
             tags_html=tags_html,
             hero_html=hero_html,
+            summary_html=_summary_html(summary_zh),
             body_html=body_html,
             orig_url=html.escape(item.get("link", "")),
         )
@@ -553,6 +581,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             image_url=hero,
             title_zh=title_zh,
             body_zh=zh_text,
+            summary_zh=summary_zh,
             tags=tags,
         )
 
@@ -563,7 +592,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
 
 
 def _render_page_html(*, title_zh: str, source: str, published: str,
-                      orig_url: str, body_zh: str, image_url: str) -> str:
+                      orig_url: str, body_zh: str, image_url: str,
+                      summary_zh: str = "") -> str:
     """仅用已有字段渲染一张翻译页 HTML（不抓取、不翻译）。"""
     if (body_zh or "").strip():
         body_html = _para_to_html(body_zh)
@@ -588,6 +618,7 @@ def _render_page_html(*, title_zh: str, source: str, published: str,
         published=html.escape(to_beijing(published or "")),
         tags_html=tags_html,
         hero_html=hero_html,
+        summary_html=_summary_html(summary_zh),
         body_html=body_html,
         orig_url=html.escape(orig_url or ""),
     )
@@ -619,6 +650,7 @@ def rebuild_pages_from_cache(articles: list[dict]) -> int:
                 orig_url=a.get("original_link") or "",
                 body_zh=a.get("body_zh") or "",
                 image_url=a.get("image_url") or "",
+                summary_zh=a.get("summary_zh") or "",
             )
             d = PAGES_ROOT / batch_id
             d.mkdir(parents=True, exist_ok=True)

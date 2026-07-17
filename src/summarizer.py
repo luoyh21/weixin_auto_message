@@ -212,6 +212,48 @@ def translate_zh(title: str, text: str = "") -> dict:
     return {"title": title, "summary": (text or title)[:140]}
 
 
+SYS_BLURB = (
+    "你是航天领域的中文编辑。用户会给你一篇已译成简体中文的国际航天新闻（标题 + 正文）。\n"
+    "请写一段「内容概要」，要求：\n"
+    "1. 2~4 句，约 80~140 字，简体中文；\n"
+    "2. 先交代主体与事件，再补关键数字、机构、时间或影响；\n"
+    "3. 不要标题、不要编号、不要「本文」「该文」等元话语，不要重复照抄标题；\n"
+    "4. 只输出概要正文本身。"
+)
+
+
+def summarize_zh(title: str, body: str = "") -> str:
+    """根据中文标题+正文生成短概要（国际要闻用）。失败时回退正文前 120 字。"""
+    title = (title or "").strip()
+    body = (body or "").strip()
+    if not title and not body:
+        return ""
+    # 正文极短时不必再调模型
+    if body and len(body) <= 140 and not body.count("\n\n"):
+        return body
+    user = f"标题：{title}\n\n正文：\n{body[:3500]}"
+    try:
+        resp = client().chat.completions.create(
+            model=SETTINGS.openai_model,
+            messages=[
+                {"role": "system", "content": SYS_BLURB},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.25,
+            max_tokens=280,
+        )
+        out = (resp.choices[0].message.content or "").strip()
+        # 去掉偶发的引号/「内容概要：」前缀
+        for prefix in ("内容概要：", "内容概要:", "概要：", "概要:"):
+            if out.startswith(prefix):
+                out = out[len(prefix):].strip()
+        if out:
+            return out
+    except Exception as e:
+        log.warning("summarize_zh failed: %s", e)
+    return (body or title).replace("\n", " ").strip()[:120]
+
+
 SYS_SOCIAL = (
     "你是航天领域的情报分析编辑。用户会给你一条政要（如马斯克、特朗普）在社交媒体（X / Truth Social）"
     "上的帖子原文（英文为主）。\n"
