@@ -121,6 +121,21 @@ def _bj_date_part(mo: int, d: int, day_add: int) -> str:
         return f"{mo}月{d}日" + ("次日" if day_add else "")
 
 
+# 译文后处理：LLM 偶发漏译的英文专名，强制换成既定中文
+_PROPER_NOUN_FIXES = (
+    (re.compile(r"(?<![A-Za-z])Starfall(?![A-Za-z])", re.IGNORECASE), "星落"),
+)
+
+
+def fix_proper_nouns_zh(text: str) -> str:
+    """把译文里残留的英文专名换成对照表中文（如 Starfall → 星落）。"""
+    if not text:
+        return text or ""
+    for pat, repl in _PROPER_NOUN_FIXES:
+        text = pat.sub(repl, text)
+    return text
+
+
 def utc_times_to_beijing(text: str) -> str:
     """把正文里的 UTC / 协调世界时自动改写为北京时间。
 
@@ -620,7 +635,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
                 title_zh = zh_text[: first_nl].split(":", 1)[-1].split("：", 1)[-1].strip() or title_zh
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
 
-        zh_text = utc_times_to_beijing(_strip_author_bio(zh_text))
+        zh_text = fix_proper_nouns_zh(utc_times_to_beijing(_strip_author_bio(zh_text)))
+        title_zh = fix_proper_nouns_zh(title_zh)
         # 英文原文：抓取到的正文（已去 HTML），与中文译文一并落库，支持英文语义检索
         body_en = _strip_author_bio((item.get("_text") or "").strip())
 
@@ -628,7 +644,9 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
         summary_zh = ""
         if zh_text:
             try:
-                summary_zh = utc_times_to_beijing(summarize_zh(title_zh, zh_text))
+                summary_zh = fix_proper_nouns_zh(
+                    utc_times_to_beijing(summarize_zh(title_zh, zh_text))
+                )
             except Exception as e:
                 log.warning("summarize_zh failed for %s: %s", item.get("link"), e)
 
@@ -710,7 +728,8 @@ def _render_page_html(*, title_zh: str, source: str, published: str,
                       orig_url: str, body_zh: str, image_url: str,
                       summary_zh: str = "") -> str:
     """仅用已有字段渲染一张翻译页 HTML（不抓取、不翻译）。"""
-    body_zh = utc_times_to_beijing(body_zh or "")
+    body_zh = fix_proper_nouns_zh(utc_times_to_beijing(body_zh or ""))
+    title_zh = fix_proper_nouns_zh(title_zh or "")
     if body_zh.strip():
         body_html = _para_to_html(body_zh)
     else:
