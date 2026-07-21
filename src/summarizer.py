@@ -47,7 +47,8 @@ _COMMON_RULES = (
     "**专有名词须按以下译法**（即便原始材料里写的是别的中文也要改正过来）："
     "Golden Dome / Golden Dome for America → 金穹计划（不要写成『金顶』『金顶计划』『金圆顶』）；"
     "Iron Dome → 铁穹；Space Force → 美国太空军；Artemis → 阿尔忒弥斯；"
-    "Starship → 星舰；Falcon 9 → 猎鹰 9；Starlink → 星链。\n"
+    "Starship → 星舰；Falcon 9 → 猎鹰 9；Starlink → 星链；"
+    "Starfall → 星落（不要写成『落星』『坠星』『流星』）。\n"
 )
 
 SYS_DAILY_BOTH = _COMMON_RULES + (
@@ -176,7 +177,8 @@ SYS_TRANSLATE = (
     '  "title": "不超过30字的简体中文标题（必填，忠实原意，不照抄英文）",\n'
     '  "summary": "用简体中文把正文概括成2~4句（约120字以内），保留关键数字/机构/技术名词；正文为空则据标题给一句话简介"\n'
     "}\n"
-    "术语用航天业界通行中文译名；个别专有缩写可中英并存。不要寒暄、不要逐句直译堆砌。"
+    "术语用航天业界通行中文译名；个别专有缩写可中英并存。不要寒暄、不要逐句直译堆砌。\n"
+    "专有名词：Starfall → 星落；Starship → 星舰；Starlink → 星链；Falcon 9 → 猎鹰 9。"
 )
 
 

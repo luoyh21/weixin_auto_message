@@ -292,6 +292,7 @@ _TRANSLATE_SYS = (
     "- Space Rapid Capabilities Office (Space RCO) → 太空快速能力办公室\n"
     "- Artemis（NASA 月球计划）→ 阿尔忒弥斯\n"
     "- Starship → 星舰；Falcon 9 → 猎鹰 9；Starlink → 星链\n"
+    "- Starfall → **星落**（专有名，不要译成『落星』『坠星』『流星』等）\n"
     "- LEO / GEO / MEO → 低轨 / 地球同步轨道 / 中地球轨道"
 )
 
