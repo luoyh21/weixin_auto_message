@@ -628,8 +628,13 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
                     a["title_zh"] = pr.title_zh
                 if pr.body_zh:
                     a["body_zh"] = pr.body_zh
+                if pr.body_en:
+                    a["body_en"] = pr.body_en
                 if pr.summary_zh:
                     a["summary_zh"] = pr.summary_zh
+                # RSS/ingest 自带的英文 summary 保留为 summary_en，供英检索
+                if a.get("summary") and not a.get("summary_en"):
+                    a["summary_en"] = a.get("summary")
                 if pr.tags:
                     a["tags"] = pr.tags
     hero_article, hero_candidates = _pick_hero(sn)

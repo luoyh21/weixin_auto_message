@@ -419,6 +419,7 @@ class PageResult:
     image_url: str  # 选定的主图（绝对 URL）
     title_zh: str = ""   # 中文标题（若翻译失败 = 原文标题）
     body_zh: str = ""    # 中文正文（纯文本，按段落用 \n\n 分隔；翻译失败为空）
+    body_en: str = ""    # 英文原文正文（供英检索 / 对照；抓取失败为空）
     summary_zh: str = ""  # 正文前的短概要（2~4 句）
     tags: list = field(default_factory=list)  # 主题标签 + 范围标签
 
@@ -509,6 +510,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
 
         zh_text = _strip_author_bio(zh_text)
+        # 英文原文：抓取到的正文（已去 HTML），与中文译文一并落库，支持英文语义检索
+        body_en = _strip_author_bio((item.get("_text") or "").strip())
 
         # 内容概要：有中文正文时再生成；失败则跳过（页面仍可展示全文）
         summary_zh = ""
@@ -581,6 +584,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             image_url=hero,
             title_zh=title_zh,
             body_zh=zh_text,
+            body_en=body_en,
             summary_zh=summary_zh,
             tags=tags,
         )

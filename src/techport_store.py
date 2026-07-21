@@ -98,13 +98,57 @@ def _fmt_date(date_str: str, year, month) -> str:
 
 def _tx_category(detail: dict) -> tuple[str, str]:
     """返回 (技术类别中文, 类别代码)。取 primaryTx（一级取根）。"""
-    tx = detail.get("primaryTx") or {}
+    tx = detail.get("primaryTx") or (detail.get("primaryTas") or [None])[0] or {}
+    if not isinstance(tx, dict):
+        tx = {}
     code = (tx.get("code") or "").strip()
     root = code[:4] if code else ""
     zh = _TX_ZH.get(root, "")
     if not zh and tx.get("title"):
         zh = tx.get("title")  # 未收录的代码退回英文标题
     return zh, code
+
+
+def _program_fields(detail: dict) -> tuple[str, str]:
+    prog = detail.get("program") or {}
+    if not isinstance(prog, dict):
+        return "", ""
+    acronym = (prog.get("acronym") or "").strip()
+    title = (prog.get("title") or prog.get("description") or "").strip()
+    return acronym or title, title
+
+
+def _directorate(detail: dict) -> str:
+    for key in ("responsibleMissionDirectorateOrOffice", "responsibleMd",
+                "missionDirectorate", "directorate"):
+        d = detail.get(key)
+        if isinstance(d, dict):
+            return (d.get("acronym") or d.get("title") or d.get("name") or "").strip()
+        if isinstance(d, str) and d.strip():
+            return d.strip()
+    return ""
+
+
+def _lead_org(detail: dict) -> str:
+    lo = detail.get("leadOrganization") or detail.get("leadOrganizationName") or {}
+    if isinstance(lo, str):
+        return lo.strip()
+    if isinstance(lo, dict):
+        return (lo.get("organizationName") or lo.get("name") or lo.get("title") or "").strip()
+    return ""
+
+
+def _destinations(detail: dict) -> str:
+    dests = detail.get("destinations") or []
+    names = []
+    for d in dests if isinstance(dests, list) else []:
+        if isinstance(d, dict):
+            n = (d.get("title") or d.get("name") or "").strip()
+        else:
+            n = str(d or "").strip()
+        if n:
+            names.append(n)
+    return "、".join(names)
 
 
 def _now_utc() -> datetime:
@@ -211,28 +255,46 @@ def refresh() -> int:
                 continue
             title_en = (detail.get("title") or "").strip()
             desc_en = _strip_html(detail.get("description") or "")
+            benefits_en = _strip_html(detail.get("benefits") or "")
             if not title_en and not desc_en:
                 continue
             zh = translate_zh(title_en, desc_en)
+            benefits_zh = ""
+            if benefits_en:
+                try:
+                    benefits_zh = (translate_zh(title_en, benefits_en).get("summary") or "").strip()
+                except Exception:
+                    benefits_zh = ""
             upd_raw = str(detail.get("lastUpdated") or upd)
             dt = _parse_updated(upd_raw) or _now_utc()
             status_en = (detail.get("status") or "").strip()
             cat_zh, cat_code = _tx_category(detail)
+            prog, prog_title = _program_fields(detail)
+            trl_cur = detail.get("currentTrl") or detail.get("trlCurrent")
             store[str(pid)] = {
                 "project_id": pid,
                 "title": zh.get("title") or title_en,
                 "title_en": title_en,
                 "summary": zh.get("summary") or desc_en[:140],
+                "summary_en": desc_en,  # 英文原文，供英检索与详情展示
+                "benefits": benefits_zh,
+                "benefits_en": benefits_en,
                 "status": status_en,
                 "status_zh": _STATUS_ZH.get(status_en, status_en),
                 "start_date": _fmt_date(detail.get("startDateString"), detail.get("startYear"), detail.get("startMonth")),
                 "end_date": _fmt_date(detail.get("endDateString"), detail.get("endYear"), detail.get("endMonth")),
-                "trl_begin": detail.get("trlBegin"),
-                "trl_end": detail.get("trlEnd"),
+                "trl_begin": detail.get("trlBegin") or detail.get("startTrl"),
+                "trl_end": detail.get("trlEnd") or detail.get("endTrl"),
+                "trl_current": trl_cur,
                 "category": cat_zh,
                 "category_code": cat_code,
-                "program": ((detail.get("program") or {}).get("acronym")
-                            or (detail.get("program") or {}).get("title") or "").strip(),
+                "program": prog,
+                "program_title": prog_title,
+                "directorate": _directorate(detail),
+                "lead_org": _lead_org(detail),
+                "destinations": _destinations(detail),
+                "website": (detail.get("website") or "").strip(),
+                "acronym": (detail.get("acronym") or "").strip(),
                 "link": _VIEW_URL.format(pid=pid),
                 "published": dt.isoformat(),
                 "updated_raw": upd_raw,
@@ -240,28 +302,48 @@ def refresh() -> int:
             }
             added += 1
 
-        # 回填：历史条目缺结构化字段（起止/TRL/类别/计划）时补抓一次详情（不再调 LLM），每轮封顶。
+        # 回填：历史条目缺结构化字段 / 英文原文时补抓一次详情（不再调 LLM），每轮封顶。
         backfilled = 0
         for key, v in store.items():
             if backfilled >= 15:
                 break
-            if "trl_begin" in v and "category" in v:
+            need = (
+                "trl_begin" not in v or "category" not in v
+                or not (v.get("summary_en") or "").strip()
+                or "benefits_en" not in v
+            )
+            if not need:
                 continue
             detail = _fetch_detail(v.get("project_id"))
             if not detail:
                 continue
             status_en = (detail.get("status") or v.get("status") or "").strip()
             cat_zh, cat_code = _tx_category(detail)
+            prog, prog_title = _program_fields(detail)
+            desc_en = _strip_html(detail.get("description") or "")
+            benefits_en = _strip_html(detail.get("benefits") or "")
             v["status"] = status_en
             v["status_zh"] = _STATUS_ZH.get(status_en, status_en)
             v["start_date"] = _fmt_date(detail.get("startDateString"), detail.get("startYear"), detail.get("startMonth"))
             v["end_date"] = _fmt_date(detail.get("endDateString"), detail.get("endYear"), detail.get("endMonth"))
-            v["trl_begin"] = detail.get("trlBegin")
-            v["trl_end"] = detail.get("trlEnd")
+            v["trl_begin"] = detail.get("trlBegin") or detail.get("startTrl")
+            v["trl_end"] = detail.get("trlEnd") or detail.get("endTrl")
+            v["trl_current"] = detail.get("currentTrl") or detail.get("trlCurrent")
             v["category"] = cat_zh
             v["category_code"] = cat_code
-            v["program"] = ((detail.get("program") or {}).get("acronym")
-                            or (detail.get("program") or {}).get("title") or "").strip()
+            v["program"] = prog
+            v["program_title"] = prog_title
+            v["directorate"] = _directorate(detail)
+            v["lead_org"] = _lead_org(detail)
+            v["destinations"] = _destinations(detail)
+            v["website"] = (detail.get("website") or "").strip()
+            v["acronym"] = (detail.get("acronym") or "").strip()
+            if desc_en:
+                v["summary_en"] = desc_en
+            if benefits_en:
+                v["benefits_en"] = benefits_en
+            if not (v.get("title_en") or "").strip():
+                v["title_en"] = (detail.get("title") or "").strip()
             backfilled += 1
 
         # 归档完整的结构化项目记录；此目录不参与小程序列表与日常清理。
@@ -287,20 +369,32 @@ def load_recent(days: int = 14) -> list[dict]:
         if ref is None or ref < cutoff:
             continue
         out.append({
+            "project_id": v.get("project_id"),
             "title": v.get("title") or "",
             "title_en": v.get("title_en") or "",
+            "acronym": v.get("acronym") or "",
             "summary": v.get("summary") or "",
+            "summary_en": v.get("summary_en") or "",
+            "benefits": v.get("benefits") or "",
+            "benefits_en": v.get("benefits_en") or "",
             "status": v.get("status") or "",
             "status_zh": v.get("status_zh") or v.get("status") or "",
             "start_date": v.get("start_date") or "",
             "end_date": v.get("end_date") or "",
             "trl_begin": v.get("trl_begin"),
             "trl_end": v.get("trl_end"),
+            "trl_current": v.get("trl_current"),
             "category": v.get("category") or "",
             "category_code": v.get("category_code") or "",
             "program": v.get("program") or "",
+            "program_title": v.get("program_title") or "",
+            "directorate": v.get("directorate") or "",
+            "lead_org": v.get("lead_org") or "",
+            "destinations": v.get("destinations") or "",
+            "website": v.get("website") or "",
             "link": v.get("link") or "",
             "published": v.get("published") or "",
+            "updated_raw": v.get("updated_raw") or "",
         })
     out.sort(key=lambda x: x.get("published") or "", reverse=True)
     return out

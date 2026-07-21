@@ -163,6 +163,7 @@ def refresh() -> int:
                     "title": zh.get("title") or name_en,
                     "name_en": name_en,
                     "summary": zh.get("summary") or mission_desc[:140],
+                    "summary_en": mission_desc,  # 英文任务描述原文
                     "provider": provider,
                     "provider_zh": space_i18n.provider_zh(provider),
                     "pad": pad_name,
@@ -217,6 +218,7 @@ def load_recent(days: int = 14) -> list[dict]:
             "title": v.get("title") or "",
             "name_en": v.get("name_en") or "",
             "summary": v.get("summary") or "",
+            "summary_en": v.get("summary_en") or "",
             "provider": v.get("provider") or "",
             "provider_zh": v.get("provider_zh") or space_i18n.provider_zh(v.get("provider") or ""),
             "pad": v.get("pad") or "",
