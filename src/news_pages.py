@@ -76,6 +76,114 @@ def to_beijing(s: str, *, with_label: bool = True) -> str:
     out = d.astimezone(CST).strftime("%Y-%m-%d %H:%M")
     return f"{out}（北京时间）" if with_label else out
 
+
+# 正文内嵌 UTC / 协调世界时 → 北京时间（+8）。
+# 括号形式优先，避免出现「（22:49（北京时间））」双层括号；UTC 后可能紧跟中文，不用 \b。
+_UTC_PAREN_DATE = re.compile(
+    r"[（(]\s*协调世界时\s*(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[:：](\d{2})(?::(\d{2}))?\s*[）)]"
+)
+_UTC_PAREN_TIME = re.compile(
+    r"[（(]\s*协调世界时\s*(\d{1,2})[:：](\d{2})(?::(\d{2}))?\s*[）)]"
+)
+_UTC_DATE_CN = re.compile(
+    r"协调世界时\s*(\d{1,2})月(\d{1,2})日\s*(\d{1,2})[:：](\d{2})(?::(\d{2}))?"
+)
+_UTC_TIME_CN = re.compile(
+    r"(协调世界时|世界时)\s*(\d{1,2})[:：](\d{2})(?::(\d{2}))?"
+)
+_UTC_TIME_EN = re.compile(
+    r"(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(UTC|GMT)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_UTC_MARKER = re.compile(r"UTC|GMT|协调世界时|(?<!北京)世界时", re.IGNORECASE)
+
+
+def _plus8(h: int, m: int, s: int = 0) -> tuple[int, int, int, int]:
+    """返回 (时, 分, 秒, 日偏移)。"""
+    total = h * 3600 + m * 60 + s + 8 * 3600
+    day = total // 86400
+    total %= 86400
+    return total // 3600, (total % 3600) // 60, total % 60, day
+
+
+def _fmt_hm(h: int, m: int, s: int = 0, *, with_sec: bool = False) -> str:
+    if with_sec:
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}"
+
+
+def _bj_date_part(mo: int, d: int, day_add: int) -> str:
+    try:
+        base = datetime(2024, mo, d, tzinfo=timezone.utc)
+        new = base + timedelta(days=day_add)
+        return f"{new.month}月{new.day}日"
+    except Exception:
+        return f"{mo}月{d}日" + ("次日" if day_add else "")
+
+
+def utc_times_to_beijing(text: str) -> str:
+    """把正文里的 UTC / 协调世界时自动改写为北京时间。
+
+    例：
+      ``14:47 UTC`` → ``22:47（北京时间）``
+      ``协调世界时02:50`` → ``10:50（北京时间）``
+      ``（协调世界时14:49）`` → ``（北京时间 22:49）``
+      ``协调世界时7月22日02:04`` → ``7月22日10:04（北京时间）``
+    跨日时补「次日」或推进日期。已标注「北京时间」且无 UTC 字样的片段不会再改。
+    """
+    if not text or not _UTC_MARKER.search(text):
+        return text
+
+    def _repl_paren_date(m: re.Match) -> str:
+        mo, d, h, mi = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        sec_s = m.group(5)
+        s = int(sec_s) if sec_s else 0
+        nh, nm, ns, day_add = _plus8(h, mi, s)
+        t = _fmt_hm(nh, nm, ns, with_sec=bool(sec_s))
+        return f"（北京时间 {_bj_date_part(mo, d, day_add)}{t}）"
+
+    def _repl_paren_time(m: re.Match) -> str:
+        h, mi = int(m.group(1)), int(m.group(2))
+        sec_s = m.group(3)
+        s = int(sec_s) if sec_s else 0
+        nh, nm, ns, day_add = _plus8(h, mi, s)
+        t = _fmt_hm(nh, nm, ns, with_sec=bool(sec_s))
+        prefix = "次日 " if day_add else ""
+        return f"（北京时间 {prefix}{t}）"
+
+    def _repl_date(m: re.Match) -> str:
+        mo, d, h, mi = int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+        sec_s = m.group(5)
+        s = int(sec_s) if sec_s else 0
+        nh, nm, ns, day_add = _plus8(h, mi, s)
+        t = _fmt_hm(nh, nm, ns, with_sec=bool(sec_s))
+        return f"{_bj_date_part(mo, d, day_add)}{t}（北京时间）"
+
+    def _repl_cn_time(m: re.Match) -> str:
+        h, mi = int(m.group(2)), int(m.group(3))
+        sec_s = m.group(4)
+        s = int(sec_s) if sec_s else 0
+        nh, nm, ns, day_add = _plus8(h, mi, s)
+        t = _fmt_hm(nh, nm, ns, with_sec=bool(sec_s))
+        prefix = "次日" if day_add else ""
+        return f"{prefix}{t}（北京时间）"
+
+    def _repl_en_time(m: re.Match) -> str:
+        h, mi = int(m.group(1)), int(m.group(2))
+        sec_s = m.group(3)
+        s = int(sec_s) if sec_s else 0
+        nh, nm, ns, day_add = _plus8(h, mi, s)
+        t = _fmt_hm(nh, nm, ns, with_sec=bool(sec_s))
+        prefix = "次日" if day_add else ""
+        return f"{prefix}{t}（北京时间）"
+
+    out = _UTC_PAREN_DATE.sub(_repl_paren_date, text)
+    out = _UTC_PAREN_TIME.sub(_repl_paren_time, out)
+    out = _UTC_DATE_CN.sub(_repl_date, out)
+    out = _UTC_TIME_CN.sub(_repl_cn_time, out)
+    out = _UTC_TIME_EN.sub(_repl_en_time, out)
+    return out
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 HEADERS = {
     "User-Agent": UA,
@@ -169,7 +277,9 @@ _TRANSLATE_SYS = (
     "请在输出中，**每篇译文前都原样保留它自己的那个标记**（数字与先后顺序都不能变，"
     "不得新增、删除、改写、翻译或合并这些标记）；标记之外不要再输出其它标记。\n"
     "4. 除翻译正文外，不要输出任何额外说明、总结、声明、Markdown 元信息或英文备注。\n"
-    "5. 遇到段落是"
+    "5. 正文中的 UTC / GMT / Coordinated Universal Time / 协调世界时 时刻，请换算成**北京时间（UTC+8）**写出，"
+    "并标注「北京时间」；不要只保留 UTC 原时刻。\n"
+    "6. 遇到段落是"
     "『 By submitting this form, you agree to ... 』『 Sign up for our newsletter 』『 Subscribe / Sign In 』"
     "等明显是订阅广告 / 服务条款 / Cookie 提示的内容，可以直接丢弃；正文之外的真实段落不得丢。\n"
     "**专有名词对照表**（遇到下列原文必须按此中文译法，不得改写）：\n"
@@ -509,7 +619,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
                 title_zh = zh_text[: first_nl].split(":", 1)[-1].split("：", 1)[-1].strip() or title_zh
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
 
-        zh_text = _strip_author_bio(zh_text)
+        zh_text = utc_times_to_beijing(_strip_author_bio(zh_text))
         # 英文原文：抓取到的正文（已去 HTML），与中文译文一并落库，支持英文语义检索
         body_en = _strip_author_bio((item.get("_text") or "").strip())
 
@@ -517,7 +627,7 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
         summary_zh = ""
         if zh_text:
             try:
-                summary_zh = summarize_zh(title_zh, zh_text)
+                summary_zh = utc_times_to_beijing(summarize_zh(title_zh, zh_text))
             except Exception as e:
                 log.warning("summarize_zh failed for %s: %s", item.get("link"), e)
 
@@ -599,7 +709,8 @@ def _render_page_html(*, title_zh: str, source: str, published: str,
                       orig_url: str, body_zh: str, image_url: str,
                       summary_zh: str = "") -> str:
     """仅用已有字段渲染一张翻译页 HTML（不抓取、不翻译）。"""
-    if (body_zh or "").strip():
+    body_zh = utc_times_to_beijing(body_zh or "")
+    if body_zh.strip():
         body_html = _para_to_html(body_zh)
     else:
         body_html = (

@@ -189,7 +189,9 @@ def _build_mpnews_content_sn(
         pieces.append(
             f'<p><img src="{_h.escape(inline_img_url)}" style="max-width:100%;height:auto;"/></p>'
         )
-    blurb = (summary_zh or "").strip()
+    from .news_pages import utc_times_to_beijing
+    blurb = utc_times_to_beijing((summary_zh or "").strip())
+    body_zh = utc_times_to_beijing(body_zh or "")
     if blurb:
         pieces.append(
             '<div style="background:#f5f8ff;border:1px solid #e6eeff;border-radius:8px;'
