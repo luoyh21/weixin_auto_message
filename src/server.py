@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import xml.etree.ElementTree as ET
@@ -37,6 +38,8 @@ import threading  # noqa: E402
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="weixin_auto_message")
+SITE_VERIFY_FILE = ROOT / "8db1d0de822a9f222c8a3654dd5e0d72.txt"
+WECOM_VERIFY_FILE = ROOT / "WW_verify_2WokfWQtUup5lZh3.txt"
 
 # ---- 挂载微信小程序后端（独立目录 weixin_miniprogram/backend），统一走本域名 /api ----
 try:
@@ -79,6 +82,24 @@ def root():
         "endpoints": ["/weixin", "/news/{batch}/{id}", "/ingest/spacenews", "/ingest/social"],
         "batches": latest_batches(),
     }
+
+
+@app.get("/8db1d0de822a9f222c8a3654dd5e0d72.txt")
+def site_verification_file():
+    return FileResponse(
+        SITE_VERIFY_FILE,
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@app.get("/WW_verify_2WokfWQtUup5lZh3.txt")
+def wecom_trusted_domain_verification_file():
+    return FileResponse(
+        WECOM_VERIFY_FILE,
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/img")
@@ -253,6 +274,72 @@ def news_page(batch: str, page_id: str):
     if not p.exists():
         raise HTTPException(status_code=404, detail="page not found")
     return FileResponse(p, media_type="text/html; charset=utf-8")
+
+
+@app.get("/highlights/{week_id}")
+def weekly_highlights_page(week_id: str):
+    from .weekly_highlights import page_file as _weekly_page_file
+    try:
+        p = _weekly_page_file(week_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad week id")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="highlights not found")
+    return FileResponse(p, media_type="text/html; charset=utf-8")
+
+
+@app.get("/highlights/{week_id}/search")
+def weekly_highlights_search(
+    week_id: str,
+    q: str = "",
+    scope: str = "all",
+    sort: str = "score",
+    limit: int = 50,
+):
+    from .weekly_highlights import search_weekly
+    try:
+        return JSONResponse({
+            "ok": True,
+            **search_weekly(week_id, q, scope=scope, sort=sort, limit=limit),
+        })
+    except (ValueError, FileNotFoundError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="highlights not found")
+
+
+@app.get("/highlights/{week_id}/cover.png")
+def weekly_highlights_cover(week_id: str):
+    from .weekly_highlights import cover_file as _weekly_cover_file
+    try:
+        p = _weekly_cover_file(week_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad week id")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="cover not found")
+    return FileResponse(p, media_type="image/png", headers={"Cache-Control": "public, max-age=604800"})
+
+
+@app.get("/highlights/{week_id}/items/{item_id}")
+def weekly_highlights_item(week_id: str, item_id: str):
+    from .weekly_highlights import item_page_file as _weekly_item_file
+    try:
+        p = _weekly_item_file(week_id, item_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad highlights item")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="highlights item not found")
+    return FileResponse(p, media_type="text/html; charset=utf-8")
+
+
+@app.get("/highlights/{week_id}/cards/{item_id}.jpg")
+def weekly_highlights_card_image(week_id: str, item_id: str):
+    from .weekly_highlights import card_image_file as _weekly_card_file
+    try:
+        p = _weekly_card_file(week_id, item_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bad highlights card")
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="highlights card not found")
+    return FileResponse(p, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=604800"})
 
 
 @app.get("/t/{topic_id}/{page_id}")

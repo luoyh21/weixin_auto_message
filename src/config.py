@@ -28,6 +28,8 @@ class Settings:
     callback_token: str
     callback_aes_key: str
     contact_secret: str  # 通讯录同步 Secret，用于 join_qrcode 等通讯录管理接口
+    external_secret: str  # 客户联系接口凭据；默认复用已授权自建应用的 Secret
+    external_sender: str  # 创建群发任务后负责手动确认的成员 UserId
 
     # 「微信插件」关注二维码（来自企业微信后台「我的企业 → 微信插件」，静态，无 API）
     wx_plugin_url: str   # 微信插件链接，形如 https://work.weixin.qq.com/...（可本地生成二维码）
@@ -60,6 +62,10 @@ class Settings:
     evening_minute: int
     daily_tz: str
     window_hours: int
+    weekly_enabled: bool
+    weekly_day_of_week: str
+    weekly_hour: int
+    weekly_minute: int
 
     cache_dir: Path
 
@@ -82,6 +88,10 @@ def load() -> Settings:
         callback_token=_req("WECOM_CALLBACK_TOKEN"),
         callback_aes_key=_req("WECOM_CALLBACK_AES_KEY"),
         contact_secret=os.getenv("WECOM_CONTACT_SECRET", ""),
+        # 自建应用被加入「客户联系 API 可调用应用」后，可直接使用应用 Secret。
+        # WECOM_EXTERNAL_SECRET 仅保留给使用独立客户联系 Secret 的部署覆盖。
+        external_secret=os.getenv("WECOM_EXTERNAL_SECRET", "").strip() or _req("WECOM_SECRET"),
+        external_sender=os.getenv("WECOM_EXTERNAL_SENDER", "space_message").strip(),
         wx_plugin_url=os.getenv("WECOM_WX_PLUGIN_URL", "").strip(),
         wx_plugin_qr=os.getenv("WECOM_WX_PLUGIN_QR", "").strip(),
         join_url=os.getenv("WECOM_JOIN_URL", "").strip(),
@@ -101,6 +111,10 @@ def load() -> Settings:
         evening_minute=int(os.getenv("DAILY_EVENING_MINUTE", "0")),
         daily_tz=os.getenv("DAILY_TZ", "Asia/Shanghai"),
         window_hours=int(os.getenv("DAILY_WINDOW_HOURS", "12")),
+        weekly_enabled=os.getenv("WEEKLY_ENABLED", "1").strip().lower() not in ("0", "false", "no"),
+        weekly_day_of_week=os.getenv("WEEKLY_DAY_OF_WEEK", "fri").strip().lower(),
+        weekly_hour=int(os.getenv("WEEKLY_HOUR", "9")),
+        weekly_minute=int(os.getenv("WEEKLY_MINUTE", "0")),
         cache_dir=cache,
     )
 

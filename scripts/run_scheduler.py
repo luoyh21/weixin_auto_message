@@ -90,6 +90,7 @@ from src.daily import run_daily  # noqa: E402
 from src.join_qr import fetch_join_qrcode  # noqa: E402
 from src.cleanup import run as run_cleanup  # noqa: E402
 from src.wecom import send_text  # noqa: E402
+from src.weekly_highlights import create_weekly_task  # noqa: E402
 
 # 每 6 天提醒谁更换二维码、提示要覆盖的文件
 QR_REMIND_USER = "LuoYiHe"
@@ -118,6 +119,15 @@ def daily_cleanup():
         run_cleanup(days=14)
     except Exception as e:
         logging.exception("cleanup failed: %s", e)
+
+
+def weekly_highlights():
+    """打包近 7 天内容，并给指定客户联系成员创建待确认群发任务。"""
+    try:
+        task = create_weekly_task()
+        logging.info("weekly highlights task ready: %s", task.get("msgid"))
+    except Exception as e:
+        logging.exception("weekly highlights failed: %s", e)
 
 
 def douyin_selfcheck():
@@ -265,6 +275,29 @@ def main():
         id="daily_cleanup", misfire_grace_time=3600,
     )
     enabled.append("缓存清理 每日03:45")
+
+    # 每周打包 highlights 并创建群发任务；真正发送仍由 space_message 在客户端确认。
+    if SETTINGS.weekly_enabled and SETTINGS.external_secret and SETTINGS.external_sender:
+        sched.add_job(
+            weekly_highlights,
+            trigger=CronTrigger(
+                day_of_week=SETTINGS.weekly_day_of_week,
+                hour=SETTINGS.weekly_hour,
+                minute=SETTINGS.weekly_minute,
+                timezone=SETTINGS.daily_tz,
+            ),
+            id="weekly_highlights",
+            misfire_grace_time=3600,
+        )
+        enabled.append(
+            f"每周合辑 {SETTINGS.weekly_day_of_week} "
+            f"{SETTINGS.weekly_hour:02d}:{SETTINGS.weekly_minute:02d}"
+            f"→{SETTINGS.external_sender}"
+        )
+    elif SETTINGS.weekly_enabled:
+        logging.warning(
+            "weekly highlights disabled: configure WECOM_EXTERNAL_SENDER"
+        )
 
     if not enabled:
         logging.error("Both DAILY_MORNING_HOUR and DAILY_EVENING_HOUR are empty; nothing to schedule.")

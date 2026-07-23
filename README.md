@@ -75,10 +75,14 @@ $EDITOR .env
 # 仅生成不发送
 .venv/bin/python -m scripts.run_once --no-send
 
-# 4. 启动每日 9:00 定时（前台阻塞）
+# 4. 手工预览/创建每周 Highlights 群发任务
+.venv/bin/python -m scripts.run_weekly
+.venv/bin/python -m scripts.run_weekly --create-task
+
+# 5. 启动定时任务（前台阻塞）
 .venv/bin/python -m scripts.run_scheduler
 
-# 5. 启动 /weixin 回调服务（前台）
+# 6. 启动 /weixin 回调服务（前台）
 .venv/bin/python -m src.server
 # 或 systemd / pm2 / docker 守护
 ```
@@ -110,6 +114,12 @@ nohup .venv/bin/python -m src.server > logs/server.log 2>&1 &
 | `DAILY_EVENING_HOUR` / `DAILY_EVENING_MINUTE` | 晚间速递时间，默认 `17:00`；留空关闭该班次 |
 | `DAILY_TZ` | 时区，默认 `Asia/Shanghai` |
 | `DAILY_WINDOW_HOURS` | 每次抓取覆盖过去 N 小时，默认 `12`（scheduler 会按早/晚时点之差自动计算实际窗口） |
+| `WECOM_EXTERNAL_SECRET` | 可选；默认复用已获客户联系 API 权限的 `WECOM_SECRET`，仅在使用独立客户联系 Secret 时填写 |
+| `WECOM_EXTERNAL_SENDER` | 手动确认发送的企业微信成员 UserId，默认 `space_message` |
+| `WECOM_EXTERNAL_USERIDS` | 可选，逗号分隔的目标客户 external_userid；留空表示 sender 名下全部客户 |
+| `WEEKLY_ENABLED` | `1` 启用每周合辑任务；未配置客户联系 Secret 时调度器会跳过 |
+| `WEEKLY_DAY_OF_WEEK` / `WEEKLY_HOUR` / `WEEKLY_MINUTE` | 每周创建任务的时间，默认周五 `09:00` |
+| `WEEKLY_MAX_ITEMS` | 合辑网页最多展示条数，默认 `0`（展示本周全部信息） |
 | `PUBLIC_BASE_URL` | 对外可达的本服务 base URL，决定卡片里的 `/news /dy /img` 链接，例如 `http://links.he-ting.com` |
 | `DOUYIN_API_BASE` | 抖音 API 容器地址，默认 `http://127.0.0.1:8504` |
 | `DOUYIN_USERS` | 抖音账号列表，多个用 `,` 分隔。每项格式 `显示名:sec_user_id` 或仅 `sec_user_id` |
@@ -119,6 +129,38 @@ nohup .venv/bin/python -m src.server > logs/server.log 2>&1 &
 | `OPML_MAX_CARDS` | 单次速递中公众号卡片的最大条数，默认 `2` |
 | `WX_MP_APPID` / `WX_MP_APPSECRET` | 公众号 AppID / AppSecret（开发 → 基本配置） |
 | `WX_MP_ENABLED` | `1` = 每次速递同步生成公众号草稿/文章；`0` = 关闭 |
+
+## 每周 Highlights 与客户联系群发
+
+每周任务会复用已有的近 7 天国际新闻、公众号、发射、技术、空间环境和视频数据，
+生成静态合辑页、中文总结详情页与卡片配图，然后按“4 张新闻 + 1 张 TechPort +
+1 张未来发射 → 1 张公众号原文 → 1 张查看全部网页”的顺序调用
+`externalcontact/add_msg_template` 给 `WECOM_EXTERNAL_SENDER` 创建待发送任务。
+任务附带简短标题文字（实测当前企业微信链路仅附件会长期停在 41063）；接口不会直接触达客户，
+成员仍需在企业微信「群发助手」中预览并点击发送。
+
+企业微信后台需先完成：
+
+1. 给 `space_message` 开通客户联系权限，并确保客户已添加到该成员名下。
+2. 将本自建应用加入「客户联系 API 可调用应用」；完成后会直接复用 `WECOM_SECRET`。
+3. 将服务器公网 IP 加入客户联系 API 的可信 IP。
+4. 保证 `PUBLIC_BASE_URL` 为微信可访问的 HTTPS 地址。
+
+常用命令：
+
+```bash
+# 只打包，适合先检查网页和封面
+.venv/bin/python -m scripts.run_weekly
+
+# 打包并创建待确认任务；同一周已有 msgid 时自动跳过，避免重复
+.venv/bin/python -m scripts.run_weekly --create-task
+
+# 明确需要重建同一周任务时使用
+.venv/bin/python -m scripts.run_weekly --create-task --force
+```
+
+合辑地址形如 `https://links.he-ting.com/highlights/2026-W30`。链接卡片封面使用公网
+`picurl`，不需要上传临时素材。
 
 ## 在企业微信后台配置回调（分两步）
 
