@@ -23,7 +23,7 @@ from .wecom_external import create_attachment_mass_task, list_external_userids
 log = logging.getLogger(__name__)
 
 HIGHLIGHTS_DIR = ROOT / "data" / "highlights"
-MINIPROGRAM_APPID = os.getenv("WECOM_MINIPROGRAM_APPID", "wx9561f446d7eb5180").strip()
+MINIPROGRAM_APPID = os.getenv("WECOM_MINIPROGRAM_APPID", "").strip()
 KIND_LABELS = {
     "intl": "国际要闻",
     "gzh": "公众号精选",
@@ -628,6 +628,8 @@ def prepare_weekly(week_id: str | None = None) -> dict:
 
 
 def create_weekly_task(week_id: str | None = None, *, force: bool = False) -> dict:
+    if not MINIPROGRAM_APPID:
+        raise RuntimeError("未配置 WECOM_MINIPROGRAM_APPID")
     manifest = prepare_weekly(week_id)
     old_task = manifest.get("task") or {}
     if old_task.get("msgid") and not force:
