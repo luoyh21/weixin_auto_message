@@ -1,7 +1,9 @@
 """调用 OpenAI 兼容接口做摘要 / 问答。"""
 from __future__ import annotations
 
+import json
 import logging
+import re
 from typing import Iterable
 
 from openai import OpenAI
@@ -138,6 +140,52 @@ def daily_summary(
             lines[0] = prefix + stripped
             text = "\n".join(lines)
     return text
+
+
+def weekly_brief_summaries(items: list[dict]) -> dict[str, str]:
+    """把已有概览二次压缩为完整短句，供每周群发文本使用。"""
+    payload = [
+        {
+            "id": str(item.get("id") or ""),
+            "title": str(item.get("title") or ""),
+            "overview": str(item.get("summary_zh") or item.get("summary") or ""),
+        }
+        for item in items
+        if item.get("id")
+    ]
+    if not payload:
+        return {}
+    system = (
+        "你是航天资讯编辑。请仅根据每条输入的 title 和 overview，写一条更简短的中文概括。"
+        "每条只写一个语义完整的句子，建议30至55个汉字，保留主体、动作和核心结果；"
+        "不得补充输入中没有的信息，不得使用省略号（包括…、……、...），不得在句子中途截断。"
+        "只返回严格 JSON 数组，格式为 [{\"id\":\"原id\",\"summary\":\"完整短句。\"}]。"
+    )
+    response = client().chat.completions.create(
+        model=SETTINGS.openai_model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        temperature=0.2,
+    )
+    raw = (response.choices[0].message.content or "").strip()
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+    rows = json.loads(raw)
+    result: dict[str, str] = {}
+    valid_ids = {item["id"] for item in payload}
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        item_id = str(row.get("id") or "")
+        summary = " ".join(str(row.get("summary") or "").split())
+        summary = re.sub(r"(?:\.{3,}|…+)", "，", summary).strip(" ，,")
+        if item_id not in valid_ids or not summary:
+            continue
+        if summary[-1] not in "。！？!?":
+            summary += "。"
+        result[item_id] = summary
+    return result
 
 
 SYS_PAPER = (

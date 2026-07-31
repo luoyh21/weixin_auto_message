@@ -136,6 +136,120 @@ def fix_proper_nouns_zh(text: str) -> str:
     return text
 
 
+_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
+# 标题前缀里的分类标签：#商业航天 / #政策/军事
+_TITLE_TAG_RE = re.compile(r"^#([^\s#]+)\s+")
+# 翻译残留的分段标记（整行或夹在正文中）
+_SEG_MARK_RE = re.compile(
+    r"(?:#{0,6}\s*)?(?:@@@)?SEG\d+(?:(?:\s*|@{0,3})SEG\d+)*(?:@@@)?(?:\s*#{0,6})?",
+    re.IGNORECASE,
+)
+# 单独成段的 markdown 标题：#### 发射能力担忧 / ###航天局战略计划###
+_MD_HEADING_LINE_RE = re.compile(
+    r"^\s{0,3}(#{1,6})\s*(.+?)\s*#*\s*$"
+)
+
+
+def strip_title_tags(title: str) -> str:
+    """去掉标题开头的 #分类标签（标签应单独展示，不进标题）。"""
+    t = (title or "").strip()
+    while True:
+        m = _TITLE_TAG_RE.match(t)
+        if not m:
+            break
+        t = t[m.end():].strip()
+    return t
+
+
+def clean_body_markers(text: str) -> str:
+    """清除 SEG1/###@@@SEG…@@@### 等机器标记，保留真正的章节标题行供后续解析。"""
+    if not text:
+        return ""
+    out_lines: list[str] = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        raw = line.strip()
+        if not raw:
+            out_lines.append("")
+            continue
+        # 整行都是 SEG 标记 → 丢掉
+        if re.fullmatch(r"[#@\s]*SEG\d+(?:[#@\s]*SEG\d+)*[#@\s]*", raw, re.I):
+            continue
+        cleaned = _SEG_MARK_RE.sub("", line)
+        # 清完后若只剩 #/@ 噪声也丢
+        if re.fullmatch(r"[#@\s]*", cleaned or ""):
+            continue
+        out_lines.append(cleaned.rstrip())
+    text = "\n".join(out_lines)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def iter_body_blocks(text: str) -> list[tuple[str, str]]:
+    """把正文拆成块：('h2'|'h3'|'p', 文本)。识别 markdown 二级/三级标题。"""
+    text = clean_body_markers(text or "")
+    blocks: list[tuple[str, str]] = []
+    for raw in re.split(r"\n{2,}", text):
+        p = raw.strip()
+        if not p:
+            continue
+        # 单行标题
+        if "\n" not in p:
+            m = _MD_HEADING_LINE_RE.match(p)
+            if m:
+                hashes, title = m.group(1), m.group(2).strip()
+                if title and not re.search(r"SEG\d+", title, re.I) and len(title) <= 60:
+                    kind = "h2" if len(hashes) <= 3 else "h3"
+                    blocks.append((kind, title))
+                    continue
+        # 多行段：若首行是标题、其余是正文，拆开
+        lines = p.split("\n")
+        m0 = _MD_HEADING_LINE_RE.match(lines[0].strip())
+        if m0 and len(lines) > 1:
+            hashes, title = m0.group(1), m0.group(2).strip()
+            if title and len(title) <= 60:
+                kind = "h2" if len(hashes) <= 3 else "h3"
+                blocks.append((kind, title))
+                rest = "\n".join(lines[1:]).strip()
+                if rest:
+                    blocks.append(("p", rest))
+                continue
+        # 段内残留的行首 #### xxx → 拆段
+        if any(_MD_HEADING_LINE_RE.match(ln.strip()) for ln in lines):
+            buf: list[str] = []
+            for ln in lines:
+                m = _MD_HEADING_LINE_RE.match(ln.strip())
+                if m and len(m.group(2).strip()) <= 60:
+                    if buf:
+                        blocks.append(("p", "\n".join(buf).strip()))
+                        buf = []
+                    kind = "h2" if len(m.group(1)) <= 3 else "h3"
+                    blocks.append((kind, m.group(2).strip()))
+                else:
+                    buf.append(ln)
+            if buf:
+                blocks.append(("p", "\n".join(buf).strip()))
+            continue
+        blocks.append(("p", p))
+    return blocks
+
+
+def normalize_article_zh(title: str, body: str, summary: str = "") -> tuple[str, str, str]:
+    """统一清洗标题/正文/概要：去标签前缀、去 SEG、规范标题行、专名与北京时间。"""
+    title = strip_title_tags(fix_proper_nouns_zh(utc_times_to_beijing(title or "")))
+    body = fix_proper_nouns_zh(utc_times_to_beijing(clean_body_markers(body or "")))
+    # 把 #### 标题规范成单独成段，便于存盘后各端一致解析
+    parts: list[str] = []
+    for kind, content in iter_body_blocks(body):
+        if kind.startswith("h"):
+            parts.append(f"## {content}" if kind == "h2" else f"### {content}")
+        else:
+            parts.append(content)
+    body = "\n\n".join(parts)
+    summary = fix_proper_nouns_zh(utc_times_to_beijing(clean_body_markers(summary or "")))
+    summary = strip_title_tags(summary)
+    return title, body, summary
+
+
 def utc_times_to_beijing(text: str) -> str:
     """把正文里的 UTC / 协调世界时自动改写为北京时间。
 
@@ -289,12 +403,13 @@ _TRANSLATE_SYS = (
     "1. 每一段原文都必须翻译，不得跳过、合并、概括或省略；译文段落数与原文段落数必须一致。\n"
     "2. 严格保留段落分隔（即译文段落之间也用空行隔开）。\n"
     "3. 每篇英文前都有一个形如 `###@@@SEG<数字>@@@###` 的分隔标记。"
-    "请在输出中，**每篇译文前都原样保留它自己的那个标记**（数字与先后顺序都不能变，"
-    "不得新增、删除、改写、翻译或合并这些标记）；标记之外不要再输出其它标记。\n"
-    "4. 除翻译正文外，不要输出任何额外说明、总结、声明、Markdown 元信息或英文备注。\n"
+    "请在输出中，**仅在每篇译文最开头**原样保留它自己的那个标记（数字与先后顺序都不能变，"
+    "不得新增、删除、改写、翻译或合并这些标记）；**正文中间与段落内禁止出现 SEG、@@@、###@@@ 等字样**。\n"
+    "4. 除翻译正文外，不要输出任何额外说明、总结、声明或英文备注。\n"
     "5. 正文中的 UTC / GMT / Coordinated Universal Time / 协调世界时 时刻，请换算成**北京时间（UTC+8）**写出，"
     "并标注「北京时间」；不要只保留 UTC 原时刻。\n"
-    "6. 遇到段落是"
+    "6. 原文小节标题请译成简体中文，单独成段，写成 `## 标题`（不要用 #### 或把 `#` 留在正文里当纯文本）。\n"
+    "7. 遇到段落是"
     "『 By submitting this form, you agree to ... 』『 Sign up for our newsletter 』『 Subscribe / Sign In 』"
     "等明显是订阅广告 / 服务条款 / Cookie 提示的内容，可以直接丢弃；正文之外的真实段落不得丢。\n"
     "**专有名词对照表**（遇到下列原文必须按此中文译法，不得改写）：\n"
@@ -408,8 +523,14 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 .hero {{ width: 100%; border-radius: 8px; margin: 12px 0 20px; }}
 .blurb {{ background: #f5f8ff; border: 1px solid #e6eeff; border-radius: 8px;
           padding: 14px 16px; margin: 0 0 22px; }}
-.blurb .label {{ font-size: 13px; color: #1664ff; font-weight: 600; margin: 0 0 8px; }}
-.blurb .txt {{ font-size: 15px; line-height: 1.75; color: #2a3344; margin: 0; text-indent: 0; }}
+.blurb .label {{ font-size: 13px; color: #1664ff; font-weight: 600; margin: 0 0 8px;
+                 font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; }}
+.blurb .txt {{ font-size: 15px; line-height: 1.5; color: #2a3344; margin: 0; text-indent: 2em;
+               font-family: "KaiTi", "STKaiti", "楷体", "FangSong", "STFangsong", "仿宋", serif; }}
+.body h2 {{ font-size: 18px; font-weight: 700; line-height: 1.4; margin: 28px 0 12px; color: #1f2329;
+            text-indent: 0; padding-bottom: 6px; border-bottom: 1px solid #eef0f4; }}
+.body h3 {{ font-size: 16px; font-weight: 700; line-height: 1.4; margin: 22px 0 10px; color: #1f2329;
+            text-indent: 0; }}
 .body p {{ margin: 0 0 18px; font-size: 16px; text-indent: 2em; line-height: 1.9; }}
 .body img {{ max-width: 100%; height: auto; border-radius: 6px; margin: 14px 0; }}
 .footer {{ margin-top: 32px; padding-top: 16px; border-top: 1px solid #eee;
@@ -487,9 +608,47 @@ def _strip_author_bio(text: str) -> str:
     return "\n\n".join(paras).strip()
 
 
-def _para_to_html(text: str) -> str:
-    paras = [p.strip() for p in re.split(r"\n{2,}", text) if p.strip()]
-    return "\n".join(f"<p>{html.escape(p)}</p>" for p in paras)
+def _para_to_html(text: str, *, mpnews: bool = False) -> str:
+    """正文 → HTML：段落首行缩进；##/### 或原 markdown 标题 → <h2>/<h3>。
+
+    mpnews=True 时用内联样式（公众号图文常会剥掉 <style>）。
+    """
+    chunks: list[str] = []
+    for kind, content in iter_body_blocks(text or ""):
+        # 规范化后的 ## 标题
+        if kind == "p":
+            m = re.match(r"^(#{2,3})\s+(.+)$", content.strip())
+            if m and "\n" not in content.strip() and len(m.group(2)) <= 60:
+                kind = "h2" if len(m.group(1)) == 2 else "h3"
+                content = m.group(2).strip()
+        if kind == "h2":
+            if mpnews:
+                chunks.append(
+                    f'<h2 style="font-size:17px;font-weight:700;line-height:1.4;'
+                    f'margin:22px 0 10px;padding-bottom:4px;border-bottom:1px solid #eef0f4;'
+                    f'text-indent:0;color:#1f2329;">{html.escape(content)}</h2>'
+                )
+            else:
+                chunks.append(f"<h2>{html.escape(content)}</h2>")
+        elif kind == "h3":
+            if mpnews:
+                chunks.append(
+                    f'<h3 style="font-size:16px;font-weight:700;line-height:1.4;'
+                    f'margin:18px 0 8px;text-indent:0;color:#1f2329;">'
+                    f"{html.escape(content)}</h3>"
+                )
+            else:
+                chunks.append(f"<h3>{html.escape(content)}</h3>")
+        else:
+            esc = html.escape(content).replace("\n", "<br>")
+            if mpnews:
+                chunks.append(
+                    f'<p style="margin:0 0 16px;font-size:16px;text-indent:2em;'
+                    f'line-height:1.9;">{esc}</p>'
+                )
+            else:
+                chunks.append(f"<p>{esc}</p>")
+    return "\n".join(chunks)
 
 
 # ---------- Manifest 轮转 ----------
@@ -635,20 +794,30 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
                 title_zh = zh_text[: first_nl].split(":", 1)[-1].split("：", 1)[-1].strip() or title_zh
                 zh_text = zh_text[first_nl + 1:].lstrip("\n")
 
-        zh_text = fix_proper_nouns_zh(utc_times_to_beijing(_strip_author_bio(zh_text)))
-        title_zh = fix_proper_nouns_zh(title_zh)
+        zh_text = _strip_author_bio(zh_text)
         # 英文原文：抓取到的正文（已去 HTML），与中文译文一并落库，支持英文语义检索
         body_en = _strip_author_bio((item.get("_text") or "").strip())
+
+        # 标题仍全是英文时，补一次短译（避免推送/小程序标题整句英文）
+        if title_zh and not _HAS_CJK.search(title_zh):
+            try:
+                from .summarizer import translate_zh
+                t2 = (translate_zh(title_zh, (zh_text or body_en)[:800]).get("title") or "").strip()
+                if t2 and _HAS_CJK.search(t2):
+                    title_zh = t2
+            except Exception as e:
+                log.warning("title translate fallback failed: %s", e)
+
+        title_zh, zh_text, _ = normalize_article_zh(title_zh, zh_text, "")
 
         # 内容概要：有中文正文时再生成；失败则跳过（页面仍可展示全文）
         summary_zh = ""
         if zh_text:
             try:
-                summary_zh = fix_proper_nouns_zh(
-                    utc_times_to_beijing(summarize_zh(title_zh, zh_text))
-                )
+                summary_zh = summarize_zh(title_zh, zh_text)
             except Exception as e:
                 log.warning("summarize_zh failed for %s: %s", item.get("link"), e)
+        title_zh, zh_text, summary_zh = normalize_article_zh(title_zh, zh_text, summary_zh)
 
         if zh_text:
             body_html = _para_to_html(zh_text)
@@ -687,7 +856,8 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             '<div class="tags">' + "".join(f"<span>#{html.escape(t)}</span>" for t in tags) + "</div>"
             if tags else ""
         )
-        title_display = (tagging.tag_prefix(tags) + title_zh).strip()
+        # 标题不再拼接 #分类标签（标签只出现在 tags 区）
+        title_display = strip_title_tags(title_zh)
 
         hero = item.get("image_url") or item.get("_og") or (item["_imgs"][0] if item["_imgs"] else "")
         hero_display = _proxy_image(hero)
@@ -728,8 +898,7 @@ def _render_page_html(*, title_zh: str, source: str, published: str,
                       orig_url: str, body_zh: str, image_url: str,
                       summary_zh: str = "") -> str:
     """仅用已有字段渲染一张翻译页 HTML（不抓取、不翻译）。"""
-    body_zh = fix_proper_nouns_zh(utc_times_to_beijing(body_zh or ""))
-    title_zh = fix_proper_nouns_zh(title_zh or "")
+    title_zh, body_zh, summary_zh = normalize_article_zh(title_zh or "", body_zh or "", summary_zh or "")
     if body_zh.strip():
         body_html = _para_to_html(body_zh)
     else:
@@ -744,7 +913,7 @@ def _render_page_html(*, title_zh: str, source: str, published: str,
         '<div class="tags">' + "".join(f"<span>#{html.escape(t)}</span>" for t in tags) + "</div>"
         if tags else ""
     )
-    title_display = (tagging.tag_prefix(tags) + (title_zh or "")).strip()
+    title_display = strip_title_tags(title_zh or "")
     hero_display = _proxy_image(image_url or "")
     hero_html = f'<img class="hero" src="{html.escape(hero_display)}" alt="">' if image_url else ""
     return _PAGE_TPL.format(

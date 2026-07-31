@@ -146,10 +146,9 @@ def _placeholder_thumb_bytes(title: str) -> bytes:
 
 
 def _para_html(text: str) -> str:
-    """纯文本按空行切段，渲染成 <p>，转义 HTML 实体。"""
-    import html as _h
-    parts = [p.strip() for p in re.split(r"\n{2,}", text or "") if p.strip()]
-    return "\n".join(f"<p>{_h.escape(p)}</p>" for p in parts)
+    """正文 HTML：段落首行缩进 + 小节标题；清除 SEG/markdown 噪声。"""
+    from .news_pages import _para_to_html
+    return _para_to_html(text or "", mpnews=True)
 
 
 def _tag_line_html(tags: list[str]) -> str:
@@ -189,19 +188,21 @@ def _build_mpnews_content_sn(
         pieces.append(
             f'<p><img src="{_h.escape(inline_img_url)}" style="max-width:100%;height:auto;"/></p>'
         )
-    from .news_pages import utc_times_to_beijing
-    blurb = utc_times_to_beijing((summary_zh or "").strip())
-    body_zh = utc_times_to_beijing(body_zh or "")
+    from .news_pages import normalize_article_zh
+    title_zh, body_zh, blurb = normalize_article_zh(title_zh or "", body_zh or "", summary_zh or "")
     if blurb:
         pieces.append(
             '<div style="background:#f5f8ff;border:1px solid #e6eeff;border-radius:8px;'
             'padding:12px 14px;margin:0 0 16px;">'
-            '<p style="color:#1664ff;font-size:13px;font-weight:600;margin:0 0 6px;">内容概要</p>'
-            f'<p style="font-size:15px;line-height:1.75;color:#2a3344;margin:0;">'
+            '<p style="color:#1664ff;font-size:13px;font-weight:600;margin:0 0 6px;'
+            'font-family:-apple-system,BlinkMacSystemFont,PingFang SC,Microsoft YaHei,sans-serif;">'
+            '内容概要</p>'
+            '<p style="font-size:15px;line-height:1.5;color:#2a3344;margin:0;text-indent:2em;'
+            'font-family:KaiTi,STKaiti,楷体,FangSong,STFangsong,仿宋,serif;">'
             f'{_h.escape(blurb)}</p></div>'
         )
     if body_zh:
-        pieces.append(f'<div style="font-size:16px;line-height:1.75;">{_para_html(body_zh)}</div>')
+        pieces.append(f'<div style="font-size:16px;line-height:1.9;">{_para_html(body_zh)}</div>')
     else:
         pieces.append('<p style="color:#8c4a00;">原文正文未能抓取，请点击下方「阅读原文」查看英文版。</p>')
     if original_link:
@@ -743,9 +744,11 @@ def run_daily(send: bool = True, session_label: str = "每日", session_key: str
             hero_ref0 = (hero_article or {}).get("original_link") if hero_article else ""
 
             def _build_intl(a: dict, use_hero: bool) -> tuple[dict, dict | None]:
-                title = (a.get("title_zh") or a.get("title") or "").strip()
+                from .news_pages import strip_title_tags
+                title = strip_title_tags((a.get("title_zh") or a.get("title") or "").strip())
                 tags = a.get("tags") or tagging.tags_for(title, scope="国际新闻")
-                titled = (tagging.tag_prefix(tags) + title).strip()  # 标题只放一个标签
+                # 分类标签只放正文 chips，不拼进图文消息标题
+                titled = title
                 card: dict = {"title": titled[:120], "url": a.get("link", "")}
                 src_img = _upgrade_image_to_full(a.get("image_url") or "")
                 src_ref = a.get("original_link") or a.get("link") or ""

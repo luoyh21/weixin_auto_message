@@ -143,6 +143,23 @@ def create_attachment_mass_task(
             else:
                 image["pic_url"] = _utf8_truncate(pic_url, 2048)
             normalized.append({"msgtype": "image", "image": image})
+        elif msgtype == "miniprogram":
+            source = attachment.get("miniprogram") or {}
+            title = str(source.get("title") or "")
+            pic_media_id = str(source.get("pic_media_id") or "")
+            appid = str(source.get("appid") or "")
+            page = str(source.get("page") or "")
+            if not title or not pic_media_id or not appid or not page:
+                raise ValueError("小程序附件需要 title、pic_media_id、appid 和 page")
+            normalized.append({
+                "msgtype": "miniprogram",
+                "miniprogram": {
+                    "title": _utf8_truncate(title, 64),
+                    "pic_media_id": pic_media_id,
+                    "appid": appid,
+                    "page": _utf8_truncate(page, 2048),
+                },
+            })
         else:
             raise ValueError(f"暂不支持的群发附件类型: {msgtype}")
 

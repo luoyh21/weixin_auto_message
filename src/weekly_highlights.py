@@ -16,11 +16,14 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .config import ROOT, SETTINGS
 from .img_proxy import public_base
+from .summarizer import weekly_brief_summaries
+from .wecom import upload_temp_image_bytes
 from .wecom_external import create_attachment_mass_task, list_external_userids
 
 log = logging.getLogger(__name__)
 
 HIGHLIGHTS_DIR = ROOT / "data" / "highlights"
+MINIPROGRAM_APPID = os.getenv("WECOM_MINIPROGRAM_APPID", "wx9561f446d7eb5180").strip()
 KIND_LABELS = {
     "intl": "国际要闻",
     "gzh": "公众号精选",
@@ -251,6 +254,90 @@ def _selected_cards(items: list[dict]) -> list[dict]:
     return selected[:6]
 
 
+def _without_ellipsis(value: object) -> str:
+    import re
+    text = " ".join(_paragraphs(str(value or "")))
+    return re.sub(r"(?:\.{3,}|…+)", "，", text).strip(" ，,")
+
+
+def _future_delivery_overview(item: dict) -> str:
+    launches = (item.get("launches") or [])[:2]
+    parts: list[str] = []
+    for launch in launches:
+        when = _without_ellipsis(launch.get("net_bj") or "时间待定")
+        name = _without_ellipsis(
+            launch.get("name_zh") or launch.get("name_en") or "未命名任务"
+        )
+        provider = _without_ellipsis(
+            launch.get("provider_zh") or launch.get("provider") or ""
+        )
+        subject = f"{provider}将执行{name}" if provider else name
+        parts.append(f"{when}，{subject}")
+    if not parts:
+        return "未来暂无已排期发射。……"
+    return "；".join(parts).rstrip("。！？!?；;") + "。……"
+
+
+def _apply_weekly_briefs(items: list[dict], previous: dict) -> None:
+    """复用未变化的历史概括，仅对新增/更新新闻调用 LLM。"""
+    previous_by_id = {
+        item.get("id"): item
+        for item in (previous.get("items") or [])
+        if item.get("id")
+    }
+    candidates = [
+        item for item in items
+        if item.get("kind") not in ("gzh", "future")
+    ]
+    pending: list[dict] = []
+    for item in candidates:
+        source = str(item.get("summary_zh") or item.get("summary") or "")
+        old = previous_by_id.get(item.get("id")) or {}
+        if old.get("weekly_brief") and old.get("weekly_brief_source") == source:
+            item["weekly_brief"] = old["weekly_brief"]
+            item["weekly_brief_source"] = source
+        else:
+            pending.append(item)
+    generated: dict[str, str] = {}
+    if pending:
+        try:
+            generated = weekly_brief_summaries(pending)
+        except Exception:
+            log.exception("weekly LLM brief generation failed")
+    for item in pending:
+        source = str(item.get("summary_zh") or item.get("summary") or "")
+        brief = generated.get(str(item.get("id") or ""))
+        if not brief:
+            clean = _without_ellipsis(source)
+            brief = clean if clean and clean[-1:] in "。！？!?" else f"{item.get('title') or '航天动态'}。"
+        item["weekly_brief"] = brief
+        item["weekly_brief_source"] = source
+
+
+def _delivery_overview(items: list[dict], total: int, delivery_title: str) -> str:
+    """生成与附件编号一致的简短概览，控制在企业微信文本上限内。"""
+    lines = [
+        delivery_title,
+        "",
+        f"本周共汇总 {total} 条动态，以下是本次精选新闻概览：",
+    ]
+    for index, item in enumerate(items, 1):
+        label = KIND_LABELS.get(str(item.get("kind") or ""), "航天动态")
+        title = _without_ellipsis(item.get("title") or "未命名动态")
+        lines.extend(["", f"{index:02d}｜{label}｜{title}"])
+        if item.get("kind") == "gzh":
+            continue
+        summary = (
+            _future_delivery_overview(item)
+            if item.get("kind") == "future"
+            else _without_ellipsis(item.get("weekly_brief") or item.get("title"))
+        )
+        if summary and summary[-1:] not in "。！？!?…":
+            summary += "。"
+        lines.append(summary)
+    return "\n".join(lines)
+
+
 def _paragraphs(value: str) -> list[str]:
     import re
     text = html.unescape(re.sub(r"<[^>]+>", "\n", value or ""))
@@ -352,6 +439,29 @@ def _make_card_image(item: dict, week_id: str) -> str:
         except Exception as exc:
             log.warning("weekly card image fallback id=%s: %s", item.get("id"), exc)
     return f"{public_base().rstrip('/')}/highlights/{week_id}/cover.png"
+
+
+def _miniprogram_cover_bytes(week_id: str, item: dict | None = None) -> bytes:
+    source = cover_file(week_id)
+    if item and item.get("id"):
+        candidate = card_image_file(week_id, str(item["id"]))
+        if candidate.exists():
+            source = candidate
+    image = Image.open(source).convert("RGB")
+    target_ratio = 520 / 416
+    ratio = image.width / image.height
+    if ratio > target_ratio:
+        width = int(image.height * target_ratio)
+        left = (image.width - width) // 2
+        image = image.crop((left, 0, left + width, image.height))
+    elif ratio < target_ratio:
+        height = int(image.width / target_ratio)
+        top = (image.height - height) // 2
+        image = image.crop((0, top, image.width, top + height))
+    image = image.resize((520, 416), Image.LANCZOS)
+    output = BytesIO()
+    image.save(output, "JPEG", quality=86, optimize=True)
+    return output.getvalue()
 
 
 def _render_page(title: str, summary: str, period: str, items: list[dict], week_id: str) -> str:
@@ -462,11 +572,14 @@ def prepare_weekly(week_id: str | None = None) -> dict:
     period = f"{start:%Y年%m月%d日}—{end:%m月%d日}"
     month_week = (end.day - 1) // 7 + 1
     title = f"🚀 {end.month}月第{month_week}周航天 Highlights"
+    delivery_title = f"{end.year}-{end.month}月第{month_week}周｜本周航天概览"
     summary = _summary(items)
     base = public_base().rstrip("/")
     page_url = f"{base}/highlights/{week_id}"
     cover_url = f"{base}/highlights/{week_id}/cover.png"
 
+    featured = _selected_cards(items)
+    _apply_weekly_briefs(featured, previous)
     cover_period = f"{start:%b %d} - {end:%b %d, %Y}".upper()
     _make_cover(cover_file(week_id), cover_period, len(items))
     for item in items:
@@ -482,16 +595,27 @@ def prepare_weekly(week_id: str | None = None) -> dict:
         _render_page(title, summary, period, items, week_id),
         encoding="utf-8",
     )
+    public_accounts = [
+        item for item in items
+        if item.get("kind") == "gzh" and item.get("link")
+    ][:1]
+    overview_items = featured + public_accounts
     manifest = {
+        "schema_version": 2,
         "week_id": week_id,
         "generated_at": now.isoformat(),
         "title": title,
+        "delivery_title": delivery_title,
         "summary": summary,
         "period": period,
         "page_url": page_url,
         "cover_url": cover_url,
         "item_count": len(items),
         "items": items,
+        "weekly_overview": {
+            "text": _delivery_overview(overview_items, len(items), delivery_title),
+            "item_ids": [item["id"] for item in overview_items if item.get("id")],
+        },
     }
     if previous.get("task"):
         manifest["task"] = previous["task"]
@@ -516,46 +640,25 @@ def create_weekly_task(week_id: str | None = None, *, force: bool = False) -> di
         external_userids = list_external_userids()
     if not external_userids:
         raise RuntimeError(f"{SETTINGS.external_sender} 名下没有可群发客户")
-    items = manifest.get("items") or []
-    attachments: list[dict] = []
-
-    # 固定六张精选卡片：4 国际新闻 + 1 TechPort + 1 未来发射。
-    featured = _selected_cards(items)
-    # 官方虽允许 9 个附件，但实测满 9 个会长期停在 41063；保守使用已验证可分发的 8 个。
-    public_accounts = [item for item in items if item.get("kind") == "gzh" and item.get("link")][:1]
-    for item in featured:
-        attachments.append({
-            "msgtype": "link",
-            "link": {
-                "title": item.get("title") or "航天动态",
-                "desc": item.get("summary") or f"来源：{item.get('source') or '航天信息整理'}",
-                "url": item["internal_url"],
-                "picurl": item.get("card_picurl") or manifest["cover_url"],
-            },
-        })
-    for item in public_accounts:
-        attachments.append({
-            "msgtype": "link",
-            "link": {
-                "title": item.get("title") or "公众号精选",
-                "desc": item.get("summary") or f"来源：{item.get('source') or '公众号'}",
-                "url": item["link"],
-            },
-        })
-
-    # 第八张卡片进入包含本周全部条目的合辑网页。
-    attachments.append({
-        "msgtype": "link",
-        "link": {
-            "title": f"查看本周全部 {manifest['item_count']} 条航天信息",
-            "desc": manifest["summary"],
-            "url": manifest["page_url"],
-            "picurl": manifest["cover_url"],
+    overview_media_id = upload_temp_image_bytes(
+        _miniprogram_cover_bytes(manifest["week_id"]),
+        filename=f"mini-{manifest['week_id']}-overview.jpg",
+    )
+    if not overview_media_id:
+        raise RuntimeError("小程序总览卡片封面上传失败")
+    attachments = [{
+        "msgtype": "miniprogram",
+        "miniprogram": {
+            "title": manifest.get("delivery_title") or manifest["title"],
+            "pic_media_id": overview_media_id,
+            "appid": MINIPROGRAM_APPID,
+            "page": f"pages/news/news?tab=weekly&week={manifest['week_id']}",
         },
-    })
+    }]
+    overview = manifest.get("weekly_overview") or {}
     result = create_attachment_mass_task(
         attachments=attachments,
-        text="🚀 本周航天 Highlights",
+        text=str(overview.get("text") or manifest["summary"]),
         external_userids=external_userids or None,
     )
     manifest["task"] = {
