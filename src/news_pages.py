@@ -394,6 +394,20 @@ def _extract_main_html(html_text: str, base_url: str) -> tuple[str, list[str], s
     return "\n\n".join(paragraphs[:25]), images[:10], og_img
 
 
+_EXCERPT_MARK_RE = re.compile(
+    r"(?:\[\s*(?:…|\.\.\.)\s*\]|appeared first on|the post .+ appeared first|本文最初发表于)",
+    re.I,
+)
+
+
+def is_incomplete_article_text(text: str) -> bool:
+    """Return True for feed excerpts that must not be presented as full text."""
+    value = " ".join((text or "").split())
+    if not value:
+        return True
+    return len(value) < 450 or bool(_EXCERPT_MARK_RE.search(value))
+
+
 # ---------- 批量翻译 ----------
 
 _TRANSLATE_SYS = (
@@ -601,7 +615,11 @@ def _strip_author_bio(text: str) -> str:
     paras = [p for p in re.split(r"\n{2,}", text) if p.strip()]
     while paras:
         last = paras[-1]
-        if _BIO_PAT.search(last) or (_BIO_HINT.search(last) and len(last) < 220 and ("·" in last or "记者" in last or "编辑" in last)):
+        if (
+            _BIO_PAT.search(last)
+            or re.search(r"(?:appeared first on|本文最初发表于)", last, re.I)
+            or (_BIO_HINT.search(last) and len(last) < 220 and ("·" in last or "记者" in last or "编辑" in last))
+        ):
             paras.pop()
             continue
         break
@@ -732,9 +750,11 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
             item["_text"] = text
             item["_imgs"] = imgs
             item["_og"] = og
-            log.info("use ingest content_html for %s (%d chars text)", url, len(text))
-            fetched.append(item)
-            continue
+            if not is_incomplete_article_text(text):
+                log.info("use ingest content_html for %s (%d chars text)", url, len(text))
+                fetched.append(item)
+                continue
+            log.info("ingest content is only an excerpt for %s (%d chars); retry origin", url, len(text))
 
         if not url:
             fetched.append(item)
@@ -742,9 +762,10 @@ def prepare_news_pages(articles: list[dict], batch_id: str, public_base: str | N
         try:
             r = _http_get(url)
             text, imgs, og = _extract_main_html(r.text, url)
-            item["_text"] = text
-            item["_imgs"] = imgs
-            item["_og"] = og
+            if len(text) > len(item["_text"]):
+                item["_text"] = text
+                item["_imgs"] = imgs
+                item["_og"] = og
             # 即便 200，也可能是 Cloudflare 的 "Just a moment..." 拦截页
             if not text:
                 low = (r.text or "").lower()
