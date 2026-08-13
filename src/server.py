@@ -41,6 +41,10 @@ app = FastAPI(title="weixin_auto_message")
 SITE_VERIFY_FILE = ROOT / "8db1d0de822a9f222c8a3654dd5e0d72.txt"
 WECOM_VERIFY_FILE = ROOT / "WW_verify_2WokfWQtUup5lZh3.txt"
 
+# 独立公开只读新闻 API/网页。它只读取已生成缓存，不触发抓取或 LLM。
+from .news_api import news_app  # noqa: E402
+app.mount("/news-api", news_app)
+
 # ---- 挂载微信小程序后端（独立目录 weixin_miniprogram/backend），统一走本域名 /api ----
 try:
     _WORKSPACE = ROOT.parent

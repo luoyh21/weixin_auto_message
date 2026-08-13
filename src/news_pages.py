@@ -550,6 +550,9 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 .footer {{ margin-top: 32px; padding-top: 16px; border-top: 1px solid #eee;
            font-size: 13px; color: #8a8f99; }}
 .footer a {{ color: #1664ff; word-break: break-all; }}
+.follow {{ margin-top: 34px; padding-top: 24px; border-top: 1px solid #eee; text-align: center; }}
+.follow img {{ width: 230px; height: 230px; border-radius: 12px; background: #fff; }}
+.follow p {{ color: #8a8f99; font-size: 13px; margin: 8px 0 0; }}
 </style>
 </head>
 <body>
@@ -563,6 +566,10 @@ h1 {{ font-size: 22px; line-height: 1.4; margin: 0 0 6px; }}
 </div>
 <div class="footer">
 原文链接（英文）：<a href="{orig_url}" target="_blank" rel="noopener">{orig_url}</a>
+</div>
+<div class="follow">
+<img src="/news-api/assets/wechat-qr.png" alt="航天速递二维码">
+<p>扫码关注航天速递，获取每日更新</p>
 </div>
 </body>
 </html>
