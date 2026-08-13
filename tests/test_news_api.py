@@ -35,7 +35,8 @@ def test_daily_summary_and_full_text_share_stable_item(monkeypatch, tmp_path):
 
     assert daily["count"] == 1
     assert daily["items"][0]["summary"] == "这是供桌面端显示的中文概要。"
-    assert daily["items"][0]["image"] == "https://example.com/hero.jpg"
+    assert daily["items"][0]["image"].startswith(f"{news_api.PUBLIC_BASE}/img?u=")
+    assert "w=720" in daily["items"][0]["image"]
     assert daily["items"][0]["page_url"].startswith("https://news.example/news-api/page/")
 
     detail = news_api.item_payload(daily["items"][0]["id"], date(2026, 8, 13), "morning")

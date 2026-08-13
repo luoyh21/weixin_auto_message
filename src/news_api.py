@@ -84,7 +84,9 @@ def _absolute_image(value: str) -> str:
     if not value:
         return ""
     if value.startswith("http://") or value.startswith("https://"):
-        return value
+        if value.startswith(PUBLIC_BASE):
+            return value
+        return f"{PUBLIC_BASE}/img?u={quote(value, safe='')}&w=720&q=78"
     return f"{PUBLIC_BASE}/{value.lstrip('/')}"
 
 
