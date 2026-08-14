@@ -212,10 +212,45 @@ def render_item(item_id: str, day: date, edition: str) -> str:
     return f'<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{html.escape(item["title"])}</title><style>{_STYLE}</style></head><body><main class="article"><a href="{PUBLIC_BASE}/news-api/page/{day.isoformat()}/{edition}">← 返回当日新闻</a><h1>{html.escape(item["title"])}</h1><div class="meta">{html.escape(item["source"])} · {html.escape(item["published"])}</div>{hero}<section class="summary">{html.escape(item["summary_zh"] or item["summary"])}</section><div class="body">{body}</div>{original}{_qr_footer()}</main></body></html>'
 
 
+def render_api_docs() -> str:
+    """Return dependency-free API documentation that also works behind strict networks."""
+    today = date.today().isoformat()
+    base = f"{PUBLIC_BASE}/news-api"
+    endpoints = (
+        ("GET", "/dates", "列出近 31 天内有缓存的日期和时段", f"{base}/dates"),
+        ("GET", "/daily", "获取指定日期、上午刊或下午刊的新闻图片与概要", f"{base}/daily?date={today}&edition=morning"),
+        ("GET", "/item/{item_id}", "按条目 ID 获取新闻全文、概要及原始网址", f"{base}/item/ITEM_ID?date={today}&edition=morning"),
+        ("GET", "/page/{date}/{edition}", "打开适合直接阅读的当日新闻网页", f"{base}/page/{today}/morning"),
+    )
+    cards = "".join(
+        f'<article><div><b>{method}</b><code>{html.escape(path)}</code></div><p>{html.escape(description)}</p>'
+        f'<a href="{html.escape(example)}">打开示例</a><small>{html.escape(example)}</small></article>'
+        for method, path, description, example in endpoints
+    )
+    style = """
+*{box-sizing:border-box}body{margin:0;background:#071018;color:#dbe7ed;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',sans-serif;line-height:1.65}
+main{max-width:920px;margin:auto;padding:48px 20px 72px}h1{font-size:30px;margin:8px 0}.lead{color:#8da1ab;margin:0 0 28px}.badge{font:700 12px ui-monospace,monospace;color:#69d7d2;letter-spacing:.16em}
+.grid{display:grid;gap:13px}article{padding:18px 20px;border:1px solid #243843;border-radius:12px;background:#0d1821}article>div{display:flex;align-items:center;gap:12px}b{font:700 11px ui-monospace,monospace;color:#071018;background:#59d0cb;border-radius:5px;padding:4px 7px}code{font:600 14px ui-monospace,monospace;color:#dce9ee}p{color:#92a5ae;margin:10px 0}a{display:inline-block;color:#68d6d1;text-decoration:none;margin-right:14px}small{display:block;color:#5e747f;font:11px ui-monospace,monospace;margin-top:7px;overflow-wrap:anywhere}.links{display:flex;gap:10px;margin-top:24px}.links a{border:1px solid #31505b;border-radius:8px;padding:8px 12px}.note{margin-top:28px;padding:14px 16px;border-left:3px solid #59d0cb;background:#10232b;color:#9eb0b8}
+@media(max-width:600px){main{padding-top:28px}article>div{align-items:flex-start;flex-direction:column}.links{flex-direction:column}}
+"""
+    return (
+        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+        f'<title>航天速递新闻 API 文档</title><style>{style}</style></head><body><main>'
+        '<div class="badge">SPACE NEWS API · V1.0</div><h1>航天速递新闻 API</h1>'
+        '<p class="lead">公开、只读、不依赖 GPT。用于获取近 31 天的早晚航天新闻概要、图片、全文与阅读页面。</p>'
+        f'<section class="grid">{cards}</section><nav class="links"><a href="{base}/openapi.json">OpenAPI JSON</a>'
+        f'<a href="{base}/">打开今日新闻</a></nav>'
+        '<div class="note">日期格式为 YYYY-MM-DD；edition 只接受 morning 或 evening。接口失败时会返回准确的 HTTP 状态和 JSON detail。</div>'
+        '</main></body></html>'
+    )
+
+
 news_app = FastAPI(
     title="航天速递新闻 API",
     version="1.0.0",
     description="公开只读 API：获取近 31 天早晚航天新闻概要与全文；请求过程不调用 GPT。",
+    docs_url=None,
+    redoc_url=None,
 )
 
 
@@ -223,6 +258,11 @@ news_app = FastAPI(
 def news_home():
     edition = "morning" if datetime.now().hour < 16 else "evening"
     return RedirectResponse(f"/news-api/page/{date.today().isoformat()}/{edition}")
+
+
+@news_app.get("/docs", response_class=HTMLResponse, include_in_schema=False)
+def news_docs():
+    return HTMLResponse(render_api_docs())
 
 
 @news_app.get("/dates", summary="列出可查看的新闻日期")

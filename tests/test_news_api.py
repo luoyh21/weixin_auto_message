@@ -55,3 +55,15 @@ def test_daily_page_contains_cards_and_qr(monkeypatch, tmp_path):
     assert "这是供桌面端显示的中文概要" in page
     assert "/news-api/assets/wechat-qr.png" in page
     assert "上午刊" in page and "下午刊" in page
+
+
+def test_api_docs_are_self_contained(monkeypatch):
+    monkeypatch.setattr(news_api, "PUBLIC_BASE", "https://news.example")
+
+    page = news_api.render_api_docs()
+
+    assert "航天速递新闻 API" in page
+    assert "/daily?date=" in page
+    assert "/openapi.json" in page
+    assert "cdn.jsdelivr.net" not in page
+    assert "<script" not in page
