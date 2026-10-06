@@ -1,0 +1,62 @@
+name: keep-scheduled-workflows-active
+
+# GitHub 会在公共仓库连续 60 天没有仓库活动时自动停用定时 workflow。
+# 本任务每月两次写入保活时间戳，并顺带恢复所有因 inactivity 被停用的 workflow。
+on:
+  schedule:
+    # 每月 1 日和 15 日 03:17 UTC（北京时间 11:17）；远低于 60 天停用阈值。
+    - cron: "17 3 1,15 * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/keep-scheduled-workflows-active.yml
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: keep-scheduled-workflows-active
+  cancel-in-progress: false
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore workflows disabled for inactivity
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflows = await github.paginate(
+              github.rest.actions.listRepoWorkflows,
+              { owner, repo, per_page: 100 }
+            );
+
+            for (const workflow of workflows) {
+              if (workflow.state !== 'disabled_inactivity') continue;
+              core.info(`Re-enabling ${workflow.name} (${workflow.path})`);
+              await github.rest.actions.enableWorkflow({
+                owner,
+                repo,
+                workflow_id: workflow.id,
+              });
+            }
+
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Record repository activity
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          printf 'Last scheduled-workflow keepalive: %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" > .github/workflow-keepalive
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflow-keepalive
+          git commit -m "chore: keep scheduled workflows active"
+          git push origin "HEAD:${DEFAULT_BRANCH}"
