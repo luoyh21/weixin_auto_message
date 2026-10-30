@@ -1,6 +1,6 @@
 name: scrape-spacenews
 
-# 每 30 分钟在 GitHub 海外 runner 上抓取 SpaceNews RSS（含 content:encoded 全文）
+# 每天两次在 GitHub 海外 runner 上抓取 SpaceNews RSS（含 content:encoded 全文）
 # 解析后 POST 到国内服务器的 /ingest/spacenews。
 # 配置：在仓库 Settings → Secrets 中添加
 #   INGEST_URL     例 http://your.server.cn:8503/ingest/spacenews
@@ -9,10 +9,9 @@ name: scrape-spacenews
 on:
   schedule:
     # 一天 2 次。
-    # 注意：GitHub Actions 的 schedule cron 在共享 runner 上常被延迟 1~3 小时
-    # 才真正调度，所以这里写的时间是「期望提前量」——cron 标称 Beijing 05:55 /
-    # 13:55，实际触发大概率落在 07:55 / 15:55 之前，给 08:00 / 16:00 推送预留
-    # 2 小时延迟缓冲。本地 WINDOW_HOURS=24，提前抓也不会被过滤。
+    # GitHub 定时触发可能延迟数小时；开始执行和实际抓取前都检查对应时段。
+    # 仅在北京时间 05:55-07:55 / 13:55-15:55 抓取，超时静默跳过。
+    # workflow_dispatch 保留人工补抓能力，不受定时窗口限制。
     - cron: "55 21 * * *"   # 标称 05:55 Beijing（期望实际触发 ≤ 07:55）
     - cron: "55 5 * * *"    # 标称 13:55 Beijing（期望实际触发 ≤ 15:55）
   workflow_dispatch:
@@ -25,14 +24,56 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SCRAPE_EVENT: ${{ github.event_name }}
+      SCRAPE_SCHEDULE: ${{ github.event.schedule }}
     steps:
+      - name: Check Beijing scrape window
+        id: window
+        run: |
+          cat > "$RUNNER_TEMP/spacenews_schedule_gate.py" <<'PY'
+          import os
+          import sys
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          
+          
+          def allowed_now(event, schedule, now):
+              if event == "workflow_dispatch":
+                  return True
+              if event != "schedule":
+                  return False
+              local = now.astimezone(ZoneInfo("Asia/Shanghai"))
+              minute = local.hour * 60 + local.minute
+              windows = {"55 21 * * *": (355, 475), "55 5 * * *": (835, 955)}
+              bounds = windows.get(schedule)
+              return bool(bounds and bounds[0] <= minute <= bounds[1])
+          
+          
+          if __name__ == "__main__":
+              now = datetime.now(ZoneInfo("Asia/Shanghai"))
+              allowed = allowed_now(os.environ.get("SCRAPE_EVENT", ""), os.environ.get("SCRAPE_SCHEDULE", ""), now)
+              print(f"Beijing time: {now.isoformat(timespec='seconds')}; scrape_allowed={allowed}")
+              if not allowed:
+                  print("::notice::Skipping delayed scheduled scrape outside its 05:55-07:55 or 13:55-15:55 Beijing window.")
+              if "--check" in sys.argv:
+                  raise SystemExit(0 if allowed else 75)
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write("allowed=" + str(allowed).lower() + "\n")
+          PY
+          python3 "$RUNNER_TEMP/spacenews_schedule_gate.py"
       - uses: actions/checkout@v4
+        if: steps.window.outputs.allowed == 'true'
       - uses: actions/setup-python@v5
+        if: steps.window.outputs.allowed == 'true'
         with:
           python-version: "3.11"
       - name: Install deps
+        if: steps.window.outputs.allowed == 'true'
         run: pip install requests feedparser beautifulsoup4 lxml
       - name: Restore state
+        if: steps.window.outputs.allowed == 'true'
         uses: actions/cache@v4
         with:
           path: scripts/scrape_spacenews_remote.state.json
@@ -40,9 +81,18 @@ jobs:
           restore-keys: |
             spacenews-scrape-state-
       - name: Scrape & push
+        if: steps.window.outputs.allowed == 'true'
         env:
           INGEST_URL: ${{ secrets.INGEST_URL }}
           INGEST_TOKEN: ${{ secrets.INGEST_TOKEN }}
           FEED_URLS: ${{ vars.FEED_URLS || 'SpaceNews|https://spacenews.com/feed/,NASASpaceflight|https://www.nasaspaceflight.com/feed/' }}
           WINDOW_HOURS: ${{ vars.WINDOW_HOURS || '24' }}
-        run: python scripts/scrape_spacenews_remote.py
+        run: |
+          # Checkout/setup may have crossed the deadline after the first check.
+          set +e
+          python3 "$RUNNER_TEMP/spacenews_schedule_gate.py" --check
+          gate_status=$?
+          set -e
+          if [ "$gate_status" -eq 75 ]; then exit 0; fi
+          if [ "$gate_status" -ne 0 ]; then exit "$gate_status"; fi
+          python scripts/scrape_spacenews_remote.py
